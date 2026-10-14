@@ -14,7 +14,7 @@
  * statically depend on every module the facade touches (measured: a 59.7K
  * closure for a 659-token file).
  */
-import { BridgeError } from './goal-native.js';
+import { BridgeError } from './errors.js';
 
 function textResult(value: unknown): { content: { type: 'text'; text: string }[] } {
   return { content: [{ type: 'text', text: JSON.stringify(value, null, 2) }] };

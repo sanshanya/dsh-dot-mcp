@@ -187,12 +187,15 @@ test('GAP-C6: since_seq answers from the caller cursor and leaves the shared bas
 
   const page = await bridge.waitGoal('s4', 1, 0);
   assert.equal(page.progress_delta.until_seq, 40);
-  assert.equal(bridge.pollCursors.get('s4'), undefined, 'a client cursor must not move the shared baseline');
+  // The shared per-session baseline lives in the wait plane, next to the loops
+  // that read it (the facade only forwards these two verbs).
+  const cursors = bridge['waits']['cursors'];
+  assert.equal(cursors.get('s4'), undefined, 'a client cursor must not move the shared baseline');
 
   // The shared path still advances it.
   const shared = await bridge.waitGoal('s4', 1);
   assert.equal(shared.progress_delta.new_events.length, 40);
-  assert.ok(bridge.pollCursors.get('s4') !== undefined, 'the shared path records its own cursor');
+  assert.ok(cursors.get('s4') !== undefined, 'the shared path records its own cursor');
 });
 
 // ── run traceability ────────────────────────────────────────────────────────

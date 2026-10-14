@@ -20,12 +20,12 @@ ChatGPT actions ── 21 frozen tools ──▶ mcp.ts        the server object
                                           │  safe() from mcp-result.ts (47)
                                           ▼
                                      bridge.ts        the facade the tools map onto:
-                                     (1320)           sessions · views · results · native goals
-                                          │           · workspace boundary · waits · facade verbs
+                                     (1230)           sessions · views · results · native goals
+                                          │           · workspace boundary · request ids
         ┌──────────────┬──────────────────┼───────────────────┬────────────────────┐
         ▼              ▼                  ▼                   ▼                    ▼
   goal-native.ts  ask-relay.ts     session-facts.ts    result-schema.ts    workspace-guard.ts
-  (370)           (583)            (421)               (266)               (99)
+  (353)           (583)            (421)               (266)               (99)
   native goal     park + report    fold the event      turn summary +      one mutable
   mapping         approvals &      log into facts      evidence/commits/   session per
   (ctx.goals)     questions        (pure)              tags/artifacts      workspace
@@ -33,19 +33,21 @@ ChatGPT actions ── 21 frozen tools ──▶ mcp.ts        the server object
         │              │        session-delta.ts        credentials.ts             │
         │              │        (212) since_seq slices  (115) availability,        │
         │              │                  ▲             never values               │
-        │              │        temp-resources.ts (189) discovered worktrees/mkdirs │
-        ▼              ▼                  │                   │                    ▼
+        ▼              ▼        temp-resources.ts (189) discovered worktrees/mkdirs│
+   waits.ts (173)       │                  │                   │                    │
+   both long-poll       │                  │                   │                    │
+   loops + cursors      ▼                  ▼                   ▼                    ▼
    ────────────────────────────────────────────────────────────────────────────────────
-   session-read.ts (137) the list/view rows · status.ts (112) · config.ts (157)
-   http.ts (170) · log.ts (72) · request-id.ts (57) · paths.ts (47)
-   command-classify.ts (83) · session-persistence-compat.ts (45) · version.ts (12)
+   errors.ts (32) the wire error vocabulary · session-read.ts (149) the list/view rows
+   status.ts (112) · config.ts (157) · http.ts (170) · log.ts (72) · request-id.ts (57)
+   paths.ts (47) · command-classify.ts (83) · session-persistence-compat.ts (45) · version.ts (12)
 ```
 
 Entry: `index.ts` (99) — the Cordis row: resolve config, build the logger, build
 the `Bridge`, register transports (stateless HTTP or stdio), and own the
 disposer that closes them.
 
-Measured total: **5038 lines across 23 source files**. `lib/` is a build product
+Measured total: **5148 lines across 25 source files**. `lib/` is a build product
 and is untracked; `npm run build` deletes it before compiling and the release
 lane asserts exactly one artifact per source module, so a deleted module cannot
 ship as a compiled ghost (the adversarial pass once found those in a deployed
@@ -56,14 +58,14 @@ copy).
 | Module | Owns | Depends on |
 | --- | --- | --- |
 | `tools.ts` | the 21 tool declarations, their zod schemas, and the one Bridge verb each maps onto. One table, no state: the wire contract's source side | `bridge`, `mcp-result` |
-| `mcp-result.ts` | the MCP result convention: one JSON text block per success, `{error:{code,message}}` + `isError` per failure | `goal-native` (`BridgeError` only) |
+| `mcp-result.ts` | the MCP result convention: one JSON text block per success, `{error:{code,message}}` + `isError` per failure | `errors` |
 | `mcp.ts` | the `McpServer` object ChatGPT connects to; no declarations, no handlers | `tools`, `version` |
-| `bridge.ts` | the facade: session lifecycle, status/result views, the native-goal verbs, the workspace boundary, the wait loops, request-id replay, and the two MCP answer verbs forwarded to the relay | everything below |
-| `ask-relay.ts` | the human-in-the-loop plane: parking, the two reporting lanes, approval decisions, per-question answers, fail-closed settling, and the log mining that feeds both lanes | `goal-native` (error type), `session-facts`, `log` |
-| `session-read.ts` | the read plane's rows: the list-summary shape, pending counts, row status, the three title sources (live service, cold log fold, zero-I/O cache hint), ISO/truncation | `status`, `dsh-session-title` |
-| `goal-native.ts` | the structural mirror of `ctx.goals` (get/create/edit/pause/resume/clear), the wire shape `NativeGoalWire`, host-error → bridge-code translation, the wait primitive, the loop-contract constants | — |
+| `bridge.ts` | the facade: session lifecycle, status/result views, the native-goal verbs, the workspace boundary, request-id replay, and the four thin forwarders (two wait verbs to the wait plane, `dsh_approve`/`dsh_answer_question` to the relay) | everything below |
+| `ask-relay.ts` | the human-in-the-loop plane: parking, the two reporting lanes, approval decisions, per-question answers, fail-closed settling, and the log mining that feeds both lanes | `errors`, `session-facts`, `log` |
+| `session-read.ts` | the read plane's rows (`LoadedView` included): the list-summary shape, pending counts, row status, the three title sources (live service, cold log fold, zero-I/O cache hint), ISO/truncation | `status`, `dsh-session-title` |
+| `goal-native.ts` | the structural mirror of `ctx.goals` (get/create/edit/pause/resume/clear), the wire shape `NativeGoalWire`, host-error → bridge-code translation, the wait primitive, the loop-contract constants | `errors` |
 | `session-facts.ts` | folding an event log into facts: turns, tool calls, changed files, todos, messages, commands | `command-classify` |
-| `session-delta.ts` | poll cursors and the two delta modes (shared-baseline vs caller cursor) | `session-facts`, `command-classify` |
+| `session-delta.ts` | the poll-cursor map and the two delta modes (shared-baseline vs caller cursor); the *policy* of when a cursor moves lives in `waits.ts` | `session-facts`, `command-classify` |
 | `result-schema.ts` | the structured turn summary: test metrics, commits, tags, artifacts, warnings, provenance | `status`, `session-facts`, `goal-native` |
 | `credentials.ts` | which provider credentials are configured and where — never their values | — |
 | `temp-resources.ts` | discovering session-scoped temp paths in the workspace and deleting them (with two containment proofs) | `paths`, `session-facts` |
@@ -73,17 +75,25 @@ copy).
 | `session-persistence-compat.ts` | the pinned host session-persistence API (nothing else reads it) | — |
 | `command-classify.ts` | command semantics: display kind (substring) vs evidence kind (anchored) | — |
 | `request-id.ts` | the idempotency map (fingerprint + record) and its disk sidecar format | — |
+| `errors.ts` | the wire error vocabulary: `BridgeError` (code + optional details) and its goal-flavoured subclass. A leaf, so any module may raise a coded failure without depending on the facade | — |
+| `waits.ts` | the wait plane: both long-poll loops, the snapshot they answer from (`goal_outcome`, `progress_delta`, the loop contract), the parked-ask-wins rule, and the per-session poll cursors | `goal-native`, `session-delta`, `session-facts`, `ask-relay` (type), `session-read` (type), `status` |
 | `paths.ts`, `config.ts`, `log.ts`, `version.ts` | path identity/containment, config schema+resolution, the process log, the version read from `package.json` | — |
 
-No cycles: `bridge` is the only hub (17 internal modules in), and only `index`
-imports it at runtime (`tools.ts` takes the type only, `mcp-result.ts` reaches
-the error class at its owner in `goal-native`).
+No cycles: `bridge` is the only hub (18 internal modules in), and only `index`
+imports it at runtime (`tools.ts` and `mcp.ts` take the type only). The two new
+leaves point inward and never back: `errors.ts` imports nothing, and `waits.ts`
+reaches the facade only through the `WaitHost` seam the facade implements — the
+same shape as the relay's `RelayHost`.
 
 Splitting rule this tree follows: **a module owns one plane**. The relay is its
 own module because both golden-E2E defect classes landed in the seam where its
 state lived in one file and the log mining that fed it lived in another. The
-declaration table and the read rows were cut for the same reason at one remove:
-a wire change and a row-shape change have one owner each.
+declaration table, the read rows, the error vocabulary and the wait plane were
+cut for the same reason at one remove: a wire change, a row-shape change, an
+error code and a long-poll verdict each have one owner now. The wait plane in
+particular used to sit *between* the goal verbs that arm goals — the loops and
+the cursors they advance are one subject, and the rule that a parked ask wins
+over the native phase verdict is now stated where the verdict is computed.
 
 ### What a change costs (measured)
 
@@ -99,21 +109,27 @@ python3 <context-governor>/scripts/context_tracker.py --repo . explain --file sr
 
 | Surface a change touches | Before the split | After | Δ |
 | --- | --- | --- | --- |
-| MCP result envelope | `src/mcp.ts` — 64.9K | `src/mcp-result.ts` — 5.4K | **−92%** |
-| list/view row shape | `src/mcp.ts` — 64.9K | `src/session-read.ts` — 3.3K | **−95%** |
-| one tool declaration / schema | `src/mcp.ts` — 64.9K | `src/tools.ts` — 66.1K | +2% |
-| the server object | `src/mcp.ts` — 64.9K | `src/mcp.ts` — 66.3K | +2% |
+| MCP result envelope | `src/mcp.ts` — 64.9K | `src/mcp-result.ts` — 1.2K | **−98%** |
+| the error vocabulary | `src/goal-native.ts` — 4.9K | `src/errors.ts` — 0.4K | **−91%** |
+| list/view row shape | `src/mcp.ts` — 64.9K | `src/session-read.ts` — 3.4K | **−95%** |
+| the wait plane | `src/bridge.ts` — 60.6K | `src/waits.ts` — 30.2K | **−50%** |
+| one tool declaration / schema | `src/mcp.ts` — 64.9K | `src/tools.ts` — 67.7K | +4% |
+| the server object | `src/mcp.ts` — 64.9K | `src/mcp.ts` — 67.9K | +5% |
 
 (Before the split all four surfaces were the same file, `mcp.ts`, with a
 64.9K-token closure; the rows above are what each surface costs to load now.)
 
-Two of the four surfaces got 92–95% cheaper to load. The declaration table did
+Four of the six surfaces got 50–98% cheaper to load. The declaration table did
 **not**, and saying otherwise would be this document lying again: a row needs the
 facade's method signatures, so its closure still contains the facade graph. The
 split bought *locality* there — 21 rows in one table, diffable against
-`test/integration/frozen-wire.mjs` — not context. The envelope got cheaper only
-after a second pass: it imported `BridgeError` through `bridge.ts`, which pulled
-in the whole facade for a 700-token file; it now reaches the class at its owner.
+`test/integration/frozen-wire.mjs` — not context. The envelope got cheaper in two
+passes: first it stopped importing `BridgeError` through the facade, then the
+class itself moved to `errors.ts`, so a 700-token file no longer drags the goal
+mapping either. `waits.ts` is the honest middle case: waiting on a session really
+does need the event fold, the delta math, the goal seam and the relay's parked
+view — 30.2K of them, and 8.2K of that is `ask-relay.ts`, which arrives only as
+a type (`WaitingState`).
 
 Two limits of these numbers, stated so nobody over-reads them: the closure counts
 `import type` like any other import (a type-only edge is real context but not
@@ -131,7 +147,11 @@ agent). `cancel_task` → `agent.cancel({kind:'user'})` on a *live* session only
 Views (`get_session`, `get_task_status`, `get_result`, `list_sessions`) are
 projections over `ctx.agents` + `ctx.sessionPersistence`: live sessions replay
 in-memory events, cold sessions are inspected from the persisted log, and every
-list is budgeted (`sessionMaxItems/Chars`, `resultMaxItems/Chars`).
+list is budgeted (`sessionMaxItems/Chars`, `resultMaxItems/Chars`). The two
+blocking verbs are the only place the bridge keeps a loop of its own:
+`wait_until_action_required` and `wait_goal` live in `waits.ts` with the
+per-session poll cursors they advance, and both end in the same snapshot whose
+first rule is **a parked ask always wins** (see §3).
 
 ### 2. Goal plane (a 1:1 map, no supervision vocabulary)
 
@@ -202,7 +222,7 @@ dedupes in-process only, deliberately).
 | managed session ids | `bridge` | process | no |
 | goal request ids | `bridge.goalRequests` + `goal-requests.json` | process + disk | yes |
 | message request ids | `bridge` | process | no |
-| poll cursors (per session) | `bridge` | process, FIFO-capped | no |
+| poll cursors (per session) | `waits` | process, FIFO-capped | no |
 | parked approvals / questions / batches | `ask-relay` | until answered, aborted, or disposed | no |
 | workspace lock + mutation ledger | `workspace-guard` | until terminal / capped | no |
 | session truth (events, headers, titles) | **the host** | the host's | host JSONL |
@@ -227,6 +247,7 @@ deliberate write.
 
 ## Error vocabulary (stable codes on the wire)
 
+Owned by `errors.ts` — one class, no imports — and raised by every plane.
 Session/input: `SESSION_NOT_FOUND`, `SESSION_NOT_LIVE`, `SESSION_REQUIRED`,
 `SESSION_CREATE_FAILED`, `EMPTY_MESSAGE`, `NO_RESULT_YET`,
 `WORKSPACE_NOT_FOUND`, `WORKSPACE_REGISTRY_UNAVAILABLE`, `REQUEST_ID_CONFLICT`,
@@ -264,8 +285,8 @@ config naming any other tool fails at call time.
 | Tier | Command | Proves | Last measured |
 | --- | --- | --- | --- |
 | Unit | `npm test` | 161 tests over synthetic contexts and fixtures | 161/161 |
-| Release | `npm run test:release` | packs this tree, installs the tarball + official `dsh@0.2.0-rc.2` into a throwaway dir, asserts one compiled artifact per source module (no `lib/` ghosts), runs the two real-boundary lanes there | 2/2, 52 files |
-| Live | `BRIDGE_DSH_DIR=… npm run test:live` | boots a harness checkout with the packed artifact and asserts the served vocabulary | opt-in |
+| Release | `npm run test:release` | packs this tree, installs the tarball + official `dsh@0.2.0-rc.2` into a throwaway dir, asserts one compiled artifact per source module (no `lib/` ghosts), runs the two real-boundary lanes there | 2/2, 55 files |
+| Live | `BRIDGE_DSH_DIR=… npm run test:live` | boots a real harness checkout in a throwaway profile on a probed free port (never the shipped 3456) and asserts the served vocabulary | 1/1, 21 tools |
 | Golden | `npm run test:golden` | drives a RUNNING instance over MCP: real model turns, both relays, the goal lifecycle, the fail-closed edges — and fails if any frozen tool was never invoked | 79 pass · 0 fail · 0 skip (21/21 happy); 70 · 0 · 1 with `autoApproveEscalations` on |
 
 The golden lane's coverage ledger is what keeps "all 21 tools are covered" a

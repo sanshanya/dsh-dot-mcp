@@ -1,14 +1,14 @@
 {
   "version": "0.2.0",
-  "created_at": "2026-10-14T04:00:58+00:00",
-  "git_head": "6cb83a0bf265d6080e40b29adbf6717e6a28df11",
+  "created_at": "2026-10-14T04:49:31+00:00",
+  "git_head": "b8b03effb0867ffb0802302fbefb07a79bccc062",
   "estimator": "portable-v1",
   "summary": {
-    "files": 63,
-    "project_tokens": 164339,
-    "code_tokens": 152536,
+    "files": 65,
+    "project_tokens": 166718,
+    "code_tokens": 154215,
     "domains": 4,
-    "dependency_edges": 54,
+    "dependency_edges": 62,
     "cross_domain_edges": 3,
     "dependency_coverage_pct": 100.0,
     "unresolved_imports": 34
@@ -16,8 +16,8 @@
   "domains": {
     "root": {
       "files": 10,
-      "tokens": 11803,
-      "closure_tokens": 11803,
+      "tokens": 12503,
+      "closure_tokens": 12503,
       "closure_files": 10
     },
     "scripts": {
@@ -27,15 +27,15 @@
       "closure_files": 4
     },
     "src/core": {
-      "files": 23,
-      "tokens": 68380,
-      "closure_tokens": 69726,
-      "closure_files": 24
+      "files": 25,
+      "tokens": 70004,
+      "closure_tokens": 71350,
+      "closure_files": 26
     },
     "test": {
       "files": 27,
-      "tokens": 66228,
-      "closure_tokens": 67574,
+      "tokens": 66283,
+      "closure_tokens": 67629,
       "closure_files": 28
     }
   },

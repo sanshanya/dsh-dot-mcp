@@ -8,9 +8,21 @@
  * is the zero-I/O one: a cold list row gets its title from the persisted
  * projection checkpoint instead of opening the session log.
  */
+import type { Agent } from '@deepseek-ai/dsh-agent';
 import type { Session, SessionEvent, SessionHeader } from '@deepseek-ai/dsh-session';
 import { foldSessionTitle } from '@deepseek-ai/dsh-session-title';
 import { deriveStatus, foldPendingMessages, type BridgeStatus, type PendingFold } from './status.js';
+
+/**
+ * One loaded session: the live agent when attached, else the persisted log.
+ * Owned here because both the facade and the wait plane read it.
+ */
+export interface LoadedView {
+  agent?: Agent;
+  session?: Session;
+  events: readonly SessionEvent[];
+  header: SessionHeader;
+}
 
 /** One list row: the shape `dsh_list_sessions` returns. */
 export interface SessionSummary {

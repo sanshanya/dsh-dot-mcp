@@ -83,26 +83,9 @@ export function nativeGoalWire(sessionId: string, view: HostGoalView): NativeGoa
   };
 }
 
-/** Stable bridge error codes for goal failures. */
-/** Typed bridge error with a stable machine-readable code (single identity for the wire; defined here so goal-native never imports bridge). */
-export class BridgeError extends Error {
-  readonly code: string;
-  readonly details?: Record<string, unknown>;
-  constructor(code: string, message: string, details?: Record<string, unknown>) {
-    super(message);
-    this.name = 'BridgeError';
-    this.code = code;
-    if (details !== undefined) this.details = details;
-  }
-}
-
-/** Host-goal failure translated for the wire: still a BridgeError, since goal-native.ts must not import bridge.ts (bridge imports this module). */
-export class GoalNativeError extends BridgeError {
-  constructor(code: string, message: string, details?: Record<string, unknown>) {
-    super(code, message, details);
-    this.name = 'GoalNativeError';
-  }
-}
+/** The wire error vocabulary lives in its own leaf module; re-exported here for existing importers. */
+import { BridgeError, GoalNativeError } from './errors.js';
+export { BridgeError, GoalNativeError };
 
 /** Translate host GoalError codes into bridge codes. */
 function mapHostError(err: unknown, sessionId: string): never {

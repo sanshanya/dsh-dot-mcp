@@ -20,7 +20,7 @@ import type { ApprovalOutcome } from '@deepseek-ai/dsh-user-approval';
 import type { AskUserQuestionAnswer, AskUserQuestionItem } from '@deepseek-ai/dsh-user-questions';
 import type { SessionEvent } from '@deepseek-ai/dsh-session';
 import type { BridgeLogger } from './log.js';
-import { BridgeError } from './goal-native.js';
+import { BridgeError } from './errors.js';
 import { commandForCall } from './session-facts.js';
 
 /** Structural session view: fixtures may stand in for a real host session. */

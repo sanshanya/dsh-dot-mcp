@@ -13,7 +13,6 @@ import { agentPresetProjectionDefinition } from '@deepseek-ai/dsh-agent-preset-r
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import {
   SessionId,
-  type Session,
   type SessionEvent,
   type SessionHeader,
 } from '@deepseek-ai/dsh-session';
@@ -21,7 +20,7 @@ import { inspectPersistedSession, persistedHeader, sessionEvents } from './sessi
 import type { Workspace } from '@deepseek-ai/dsh-workspace';
 import type { ResolvedBridgeConfig } from './config.js';
 import type { BridgeLogger } from './log.js';
-import { isActiveStatus, isTerminalStatus, type BridgeStatus } from './status.js';
+import { isTerminalStatus, type BridgeStatus } from './status.js';
 import {
   cachedTitle,
   deriveRowStatus,
@@ -30,8 +29,10 @@ import {
   sessionSummary,
   titleOf,
   truncate,
+  type LoadedView,
   type SessionSummary,
 } from './session-read.js';
+import { WaitPlane } from './waits.js';
 export type { SessionSummary } from './session-read.js';
 import {
   assistantTextForTurn,
@@ -46,7 +47,6 @@ import {
 import { foldSessionFacts } from './session-facts.js';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { PollCursorMap, computeCatchUpDelta, computeProgressDelta, nextPollCursor } from './session-delta.js';
 import { cleanupTempResources, discoverTempResources } from './temp-resources.js';
 import {
   RequestIdMap,
@@ -54,7 +54,6 @@ import {
   type RequestRecord,
 } from './request-id.js';
 import {
-  clampWaitSeconds,
   mapGoalStartNative,
   nativeClear,
   nativeCreate,
@@ -63,10 +62,7 @@ import {
   nativeGoalWire,
   nativePause,
   nativeResume,
-  nativeWait,
   titleFromGoal,
-  DEFAULT_WAIT_SECONDS,
-  WAIT_POLL_MS,
   type GoalStartResult,
   type GoalWaitResult,
   type NativeGoalWire,
@@ -80,7 +76,7 @@ import { inspectCredentials, type CredentialStatus } from './credentials.js';
 import { BRIDGE_NAME, BRIDGE_VERSION } from './version.js';
 import { pathsEqual } from './paths.js';
 
-import { BridgeError } from './goal-native.js';
+import { BridgeError } from './errors.js';
 export { BridgeError };
 
 
@@ -141,14 +137,6 @@ export interface ResultView {
   result_schema?: ResultSchema;
 }
 
-/** One loaded session view: the live agent when attached, else persisted events. */
-interface LoadedView {
-  agent?: Agent;
-  session?: Session;
-  events: readonly SessionEvent[];
-  header: SessionHeader;
-}
-
 const require = createRequire(import.meta.url);
 
 /** DSH version string, resolved lazily from the installed package. */
@@ -168,11 +156,12 @@ export class Bridge {
   /** Sessions created through this bridge (approval answering scope). */
   private readonly managed = new Set<string>();
   private readonly relays: AskRelay;
+  /** The wait plane: both long-poll verbs plus their per-session poll cursors. */
+  private readonly waits: WaitPlane;
   private started = false;
   private readonly goalRequests = new RequestIdMap();
   private readonly messageRequests = new RequestIdMap();
   private readonly requestIdFile: string | undefined;
-  private readonly pollCursors = new PollCursorMap();
 
   readonly workspaceGuard = new WorkspaceConcurrencyGuard();
   private readonly recordedMutationCalls = new Set<string>();
@@ -190,6 +179,19 @@ export class Bridge {
       hostCanAnswer: () => this.hostCanAnswer(),
       autoApproveEscalations: () => this.cfg.autoApproveEscalations === true,
     }, log);
+
+    // The wait plane reads the facade through this seam; `now`/`sleep` are read
+    // dynamically so the unit tests can replace them on the bridge instance.
+    this.waits = new WaitPlane({
+      adopt: (sessionId) => this.adopt(sessionId),
+      loadView: (sessionId) => this.loadView(sessionId),
+      statusOf: (sessionId, view) => this.statusOf(sessionId, view),
+      waitingFor: (sessionId, events) => this.relays.waitingFor(sessionId, events),
+      goalHost: () => this.goalHost(),
+      releaseWorkspaceIfTerminal: (sessionId, status) => this.releaseWorkspaceIfTerminal(sessionId, status),
+      now: () => this.now(),
+      sleep: (ms) => this.sleep(ms),
+    });
     const home = typeof cfg.dshHome === 'string' && cfg.dshHome !== '' ? cfg.dshHome : undefined;
     this.requestIdFile = home === undefined ? undefined : join(home, 'goal-requests.json');
     if (this.requestIdFile !== undefined) this.loadRequestIds();
@@ -859,22 +861,7 @@ export class Bridge {
   }
 
   async waitUntilActionRequired(sessionId: string, waitSeconds = 120, sinceSeq?: number): Promise<GoalWaitResult> {
-    this.adopt(sessionId);
-    const seconds = Math.min(300, Math.max(1, waitSeconds));
-    const started = this.now();
-    const deadline = started + seconds * 1000;
-    let view = await this.loadView(sessionId);
-    let status = await this.statusOf(sessionId, view);
-
-    while (isActiveStatus(status) && this.now() < deadline) {
-      const remaining = deadline - this.now();
-      if (remaining <= 0) break;
-      await this.sleep(Math.min(WAIT_POLL_MS, remaining));
-      view = await this.loadView(sessionId);
-      status = await this.statusOf(sessionId, view);
-      if (!isActiveStatus(status)) break;
-    }
-    return this.nativeSnapshot(sessionId, view, status, this.now() - started, seconds, sinceSeq);
+    return this.waits.untilActionRequired(sessionId, waitSeconds, sinceSeq);
   }
 
   async getStructuredResult(sessionId: string): Promise<ResultSchema> {
@@ -1053,22 +1040,7 @@ export class Bridge {
   }
 
   async waitGoal(sessionId: string, waitSeconds?: number, sinceSeq?: number): Promise<GoalWaitResult> {
-    this.adopt(sessionId);
-    const seconds = clampWaitSeconds(waitSeconds);
-    const outcome = await nativeWait(this.goalHost(), sessionId, seconds, this.now, (ms) => this.sleep(ms));
-    const view = await this.loadView(sessionId);
-    const status = await this.statusOf(sessionId, view);
-    const result = this.nativeSnapshot(sessionId, view, status, outcome.waited_ms, seconds, sinceSeq);
-    return {
-      ...result,
-      // Single owner for goal_outcome (adversarial audit A#5): the snapshot
-      // sees parked approvals/questions — 'action_required' must win over
-      // the native phase loop's 3-value verdict; otherwise the phase loop's
-      // ended/no_goal/timeout stands. Clobbering with the 3-value outcome
-      // made dsh_wait_goal report timeout while parked.
-      goal_outcome: result.goal_outcome === 'action_required' ? result.goal_outcome : outcome.outcome,
-      ...(outcome.goal === undefined ? {} : { goal: nativeGoalWire(sessionId, outcome.goal) }),
-    };
+    return this.waits.goal(sessionId, waitSeconds, sinceSeq);
   }
 
   async stopGoal(sessionId: string): Promise<{
@@ -1104,68 +1076,6 @@ export class Bridge {
       already_stopped: false,
       status: 'cancelled',
       ...(warning === undefined ? {} : { cleanup_warning: warning }),
-    };
-  }
-
-  private nativeSnapshot(
-    sessionId: string,
-    view: LoadedView,
-    status: BridgeStatus,
-    waitedMs: number,
-    waitSeconds: number,
-    sinceSeq?: number,
-  ): GoalWaitResult {
-    const facts = foldSessionFacts(view.events);
-    const waiting = this.relays.waitingFor(sessionId, view.events);
-    const waitKind = waiting.approvals.map((item) => item.approval_id);
-    const waitQuestions = waiting.questions.map((item) => item.question_id);
-    const span2 = lastTurnSpan(view.events);
-    const changedFiles = span2 === undefined ? [] : collectChangedFiles(view.events, span2.turn);
-    const deltaInput = {
-      events: view.events,
-      ...(facts.todos === undefined ? {} : { todos: facts.todos }),
-      status,
-      changedFiles,
-      approvalIds: waitKind,
-      questionIds: waitQuestions,
-      previous: this.pollCursors.get(sessionId),
-      ...(view.agent === undefined ? {} : { agentStatus: view.agent.status }),
-    };
-    const progressDelta = sinceSeq === undefined
-      ? computeProgressDelta(deltaInput)
-      : computeCatchUpDelta(deltaInput, sinceSeq);
-    if (sinceSeq === undefined) this.pollCursors.set(sessionId, nextPollCursor(deltaInput));
-    const native = nativeGet(this.goalHost(), sessionId);
-    this.releaseWorkspaceIfTerminal(sessionId, status);
-    // Parked human action always halts the loop — do not suggest dsh_wait_goal.
-    const parked = waiting.approvals.length > 0 || waiting.questions.length > 0;
-    const running = !parked && (isActiveStatus(status)
-      || (native !== undefined && native.phase === 'active' && native.activation === 'armed'));
-    // Same goal_outcome vocabulary as dsh_wait_goal so both wait loops speak
-    // one wire dialect.
-    // no-goal + still-running session = the wait genuinely timed out (the
-    // session is busy outside any goal); no-goal + not running = no goal to wait on.
-    const goalOutcome = parked
-      ? 'action_required'
-      : native === undefined
-        ? isActiveStatus(status) ? 'timeout' : 'no_goal'
-        : native.phase === 'complete' || native.phase === 'paused' || native.phase === 'blocked'
-          ? 'ended'
-          : 'timeout';
-    return {
-      session_id: sessionId,
-      status,
-      goal_outcome: goalOutcome,
-      waited_ms: waitedMs,
-      wait_seconds: waitSeconds,
-      ...(native === undefined ? {} : { goal: nativeGoalWire(sessionId, native) }),
-      continuation_required: running,
-      ...(running
-        ? { next_tool_call: { tool: 'dsh_wait_goal', arguments: { session_id: sessionId, wait_seconds: DEFAULT_WAIT_SECONDS } } }
-        : {}),
-      ...(waiting.approvals[0] === undefined ? {} : { approval: waiting.approvals[0] }),
-      ...(waiting.questions[0] === undefined ? {} : { question: waiting.questions[0] }),
-      progress_delta: progressDelta,
     };
   }
 
