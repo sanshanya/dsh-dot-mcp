@@ -1,0 +1,38 @@
+version: 1
+token_estimator: portable-v1
+ignore:
+- .git/**
+- .context/**
+- node_modules/**
+- vendor/**
+- .venv/**
+- venv/**
+- dist/**
+- build/**
+- target/**
+- coverage/**
+- __pycache__/**
+- .next/**
+- .turbo/**
+- .cache/**
+- '*.min.js'
+- '*.min.css'
+- '*.map'
+- package-lock.json
+- pnpm-lock.yaml
+- yarn.lock
+- bun.lock
+- bun.lockb
+- Cargo.lock
+- poetry.lock
+- uv.lock
+- go.sum
+- '*.generated.*'
+- '*.snap'
+domains: {}
+observe:
+  project_growth_pct: 10
+  closure_growth_pct: 25
+  closure_growth_tokens: 3000
+  cross_domain_edges_added: 2
+history_limit: 50
