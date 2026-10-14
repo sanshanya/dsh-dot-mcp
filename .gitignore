@@ -1,0 +1,26 @@
+lib/
+node_modules/
+node_modules
+tools/
+.npm-cache/
+*.log
+*.tgz
+.DS_Store
+
+.preview-settings.html
+.preview-*.png
+
+# control-plane unit-test temp dirs
+/.ctrl-*/
+/.test-tmp/
+/.npm-cache-local/
+/.repair-*/
+/.auth-token-*/
+/.listener-host-*/
+/scratch/
+*.docx
+
+# local screenshot review/export artifacts (published copies live in assets/)
+/Weixin Image_*.png
+/bridge-market-screenshots/
+/bridge-market-screenshots-CONTACT.png

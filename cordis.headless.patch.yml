@@ -1,0 +1,6 @@
+# Optional overlay for a headless (no dsh-web-app) profile.
+# DSH 0.1.7-rc.2 dsh-base already owns storage and session-projection-cache.
+# Add only workspace for a base-backed headless profile, never over dsh-web-app.
+- insert:
+    - id: workspace
+      name: '@deepseek-ai/dsh-workspace'
