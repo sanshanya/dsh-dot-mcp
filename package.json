@@ -20,7 +20,8 @@
   "cordis.headless.patch.yml",
   "README.md",
   "ARCHITECTURE.md",
-  "LICENSE"
+  "LICENSE",
+  "assets"
  ],
  "license": "MIT",
  "repository": {
