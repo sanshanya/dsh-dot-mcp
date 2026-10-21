@@ -22,6 +22,7 @@ const EXPECTED_TOOLS = [
   'dsh_health',
   'dsh_list_sessions',
   'dsh_list_workspaces',
+  'dsh_message_status',
   'dsh_pause_goal',
   'dsh_resume_goal',
   'dsh_revise_goal',
@@ -124,14 +125,16 @@ test('createMcpServer registers all public dsh_* tools (v0.5.0)', () => {
   const server = createMcpServer({});
   const names = Object.keys(server._registeredTools).sort();
   assert.deepEqual(names, [...EXPECTED_TOOLS].sort());
-  assert.equal(names.length, 21);
+  assert.equal(names.length, 22);
 });
 
 test('request_id is optional in the advertised schema wherever offered (0.7.x bug)', () => {
   const server = createMcpServer({});
   for (const name of EXPECTED_TOOLS) {
     const shape = server._registeredTools[name].inputSchema?.shape ?? {};
-    if ('request_id' in shape) {
+    // Exception: dsh_message_status LOOKS UP a receipt — request_id is its key,
+    // not an idempotency option, and stays required.
+    if ('request_id' in shape && name !== 'dsh_message_status') {
       assert.ok(shape.request_id.safeParse(undefined).success,
         `${name}: request_id must be optional in the advertised schema (handler treats it optional)`);
     }
@@ -160,14 +163,14 @@ test('package manifest pins the verified npm latest baseline without claiming ot
   const manifest = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8'));
   for (const section of ['dependencies', 'devDependencies']) {
     for (const [packageName, version] of Object.entries(manifest[section] ?? {})) {
-      if (packageName.startsWith('@deepseek-ai/dsh-')) assert.equal(version, '0.2.0-rc.2', `${section}.${packageName}`);
+      if (packageName.startsWith('@deepseek-ai/dsh-')) assert.equal(version, '0.2.1-rc.2', `${section}.${packageName}`);
     }
   }
   for (const name of ['agent', 'agent-preset-registry', 'session', 'session-title', 'llm']) {
-    assert.equal(manifest.peerDependencies[`@deepseek-ai/dsh-${name}`], '0.2.0-rc.2');
+    assert.equal(manifest.peerDependencies[`@deepseek-ai/dsh-${name}`], '0.2.1-rc.2');
     assert.equal(manifest.dependencies[`@deepseek-ai/dsh-${name}`], undefined);
   }
-  assert.equal(manifest.devDependencies['@deepseek-ai/cordis'], '4.0.4');
+  assert.equal(manifest.devDependencies['@deepseek-ai/cordis'], '4.0.5');
 });
 
 test('package.json and package-lock.json carry the same release version', () => {

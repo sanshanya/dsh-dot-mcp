@@ -92,7 +92,8 @@ test('goal 轮预算耗尽后 resume 被宿主拒绝（GOAL_INVALID_TRANSITION�
   const goals = makeGoalsService();
   const ctx = fakeCtx(goals);
   nativeCreate(ctx, 's1', { objective: 'one', max_goal_rounds: 1 });
-  nativeResume(ctx, 's1'); // 激活？——不改轮次数；用 fake hook 或造假耗
+  goals.__disarm({ id: 's1' });
+  nativeResume(ctx, 's1'); // Re-arm a recovered goal; no round is admitted by resume itself.
   goals.__setPhase(agent('s1'), 'blocked', { roundsStarted: 1 });
   assert.throws(() => nativeResume(ctx, 's1'), (error) => error.code === 'GOAL_INVALID_TRANSITION');
 });

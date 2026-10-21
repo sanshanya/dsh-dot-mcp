@@ -3,7 +3,7 @@
  * Stores only a cursor, never unbounded history.
  */
 import type { ActionKind, LooseEvent } from './session-facts.js';
-import { lastEventSeq, parseArgsJson, extractCommand } from './session-facts.js';
+import { lastEventSeq, parseArgsJson, extractCommand, toolResultOutcome } from './session-facts.js';
 import { classifyCommand } from './command-classify.js';
 
 export const DELTA_EVENTS_MAX = 40;
@@ -64,13 +64,10 @@ function summarizeEvent(event: LooseEvent): DeltaEvent {
     const kinds = command === undefined ? [] : classifyCommand(command);
     const kind = kinds.find((item) => item !== 'unknown');
     if (kind !== undefined) out.kind = kind;
-  } else if (event.type === 'tool/result' && data !== undefined) {
-    const message = asRecord(data.message);
-    const source = message === undefined ? undefined : asRecord(message.source);
+  } else if (event.type === 'tool/result') {
+    const source = asRecord(asRecord(data?.message)?.source);
     if (typeof source?.callId === 'string') out.name = source.callId;
-    const isError = data.error !== undefined
-      || (Array.isArray(message?.content) && (message.content[0] as { isError?: boolean } | undefined)?.isError === true);
-    out.ok = !isError;
+    out.ok = toolResultOutcome(event.data).ok;
   } else if (event.type === 'todo/write') {
     out.name = 'todo';
   }

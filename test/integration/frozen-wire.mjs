@@ -24,6 +24,7 @@ export const FROZEN_TOOL_NAMES = [
   'dsh_health',
   'dsh_list_sessions',
   'dsh_list_workspaces',
+  'dsh_message_status',
   'dsh_pause_goal',
   'dsh_resume_goal',
   'dsh_revise_goal',

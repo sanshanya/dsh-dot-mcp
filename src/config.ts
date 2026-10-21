@@ -1,7 +1,9 @@
 import { join } from 'node:path';
 import { isIP } from 'node:net';
+import { isVolatile, type Volatile } from '@deepseek-ai/cosmokit';
 import z from '@deepseek-ai/schemastery';
 import type { LogLevel } from './log.js';
+import { CONFIG_DEFAULTS } from './shared/defaults.js';
 
 /**
  * Plugin configuration (schemastery schema, DSH convention). All defaults are
@@ -14,21 +16,6 @@ import type { LogLevel } from './log.js';
  * waiting for anyone; off by default, and the relay's parking path stays the
  * default posture.)
  */
-/** Single source for the primitive defaults; schema AND resolveConfig consume this. */
-const CONFIG_DEFAULTS = {
-  transport: 'http' as const,
-  host: '127.0.0.1',
-  port: 3456,
-  resultMaxChars: 8000,
-  resultMaxItems: 50,
-  sessionMaxItems: 20,
-  sessionMaxChars: 4000,
-  logLevel: 'info' as const,
-  autoApproveEscalations: false,
-};
-
-/** Single source for the primitive defaults; schema AND resolveConfig consume this. */
-
 export const ConfigSchema = z.object({
   /** MCP transport: 'http' (Streamable HTTP) or 'stdio' (local MCP clients). */
   transport: z.union([z.const('http'), z.const('stdio')]).default(CONFIG_DEFAULTS.transport),
@@ -36,48 +23,68 @@ export const ConfigSchema = z.object({
   host: z.string().default(CONFIG_DEFAULTS.host),
   /** Bind port for the Streamable HTTP server. */
   port: z.number().min(1).max(65535).default(CONFIG_DEFAULTS.port),
-  /** Max characters of assistant text returned by dsh_get_result. */
-  resultMaxChars: z.number().default(CONFIG_DEFAULTS.resultMaxChars),
-  /** Max tool calls returned by dsh_get_result. */
-  resultMaxItems: z.number().default(CONFIG_DEFAULTS.resultMaxItems),
-  /** Max message rows returned by dsh_get_session. */
-  sessionMaxItems: z.number().default(CONFIG_DEFAULTS.sessionMaxItems),
-  /** Max characters per message text returned by dsh_get_session. */
-  sessionMaxChars: z.number().default(CONFIG_DEFAULTS.sessionMaxChars),
-  /** Log verbosity: debug | info | warn | error. */
-  logLevel: z.union([z.const('debug'), z.const('info'), z.const('warn'), z.const('error')]).default(CONFIG_DEFAULTS.logLevel),
+  /** Max characters of assistant text returned by dsh_get_result. Volatile: live-editable from the DSH settings UI. */
+  resultMaxChars: z.number().default(CONFIG_DEFAULTS.resultMaxChars).volatile(),
+  /** Max tool calls returned by dsh_get_result. Volatile: live-editable from the DSH settings UI. */
+  resultMaxItems: z.number().default(CONFIG_DEFAULTS.resultMaxItems).volatile(),
+  /** Max message rows returned by dsh_get_session. Volatile: live-editable from the DSH settings UI. */
+  sessionMaxItems: z.number().default(CONFIG_DEFAULTS.sessionMaxItems).volatile(),
+  /** Max characters per message text returned by dsh_get_session. Volatile: live-editable from the DSH settings UI. */
+  sessionMaxChars: z.number().default(CONFIG_DEFAULTS.sessionMaxChars).volatile(),
+  /** Log verbosity: debug | info | warn | error. Volatile: live-editable from the DSH settings UI. */
+  logLevel: z.union([z.const('debug'), z.const('info'), z.const('warn'), z.const('error')]).default(CONFIG_DEFAULTS.logLevel).volatile(),
   /**
    * Auto-grant every sandbox-escalation ask on a bridge-managed session, to the
    * mode the tool requested (usually `danger-full-access`), instead of parking
    * it for a driver/GUI decision. Off by default: parking is the relay's job.
+   * Volatile: live-editable from the DSH settings UI.
    */
-  autoApproveEscalations: z.boolean().default(CONFIG_DEFAULTS.autoApproveEscalations),
+  autoApproveEscalations: z.boolean().default(CONFIG_DEFAULTS.autoApproveEscalations).volatile(),
+  /**
+   * Master switch for the MCP surface. When false, the HTTP server stays
+   * bound (so the settings panel can still reach GET /status and flip this
+   * back) but every MCP request is refused with 503 `bridge-disabled`.
+   * Volatile: flips live from the DSH settings UI without a host restart.
+   */
+  enabled: z.boolean().default(CONFIG_DEFAULTS.enabled).volatile(),
 });
 
-/** Input shape accepted from the cordis row config (schema input side). */
+/** A schema value that may arrive as a live cosmokit Volatile handle or a plain constant (unit fixtures). */
+export type VolatileConfig<T> = T | Volatile<T>;
+
+/** Read a possibly-volatile configuration value at call time; plain constants pass through. */
+export function liveValue<T>(value: VolatileConfig<T>): T {
+  // VolatileSnapshot<T> is a readonly-deep alias of T for the primitive config
+  // fields we mark volatile; the cast narrows the guaranteed-safe case.
+  return (isVolatile(value) ? value.get() : value) as T;
+}
+
+/** Input shape accepted from the cordis row config (schema parse side; marked fields arrive Volatile-wrapped at runtime). */
 export interface BridgeConfigInput {
   transport?: 'http' | 'stdio';
   host?: string;
   port?: number;
-  resultMaxChars?: number;
-  resultMaxItems?: number;
-  sessionMaxItems?: number;
-  sessionMaxChars?: number;
-  logLevel?: LogLevel;
-  autoApproveEscalations?: boolean;
+  resultMaxChars?: VolatileConfig<number>;
+  resultMaxItems?: VolatileConfig<number>;
+  sessionMaxItems?: VolatileConfig<number>;
+  sessionMaxChars?: VolatileConfig<number>;
+  logLevel?: VolatileConfig<LogLevel>;
+  autoApproveEscalations?: VolatileConfig<boolean>;
+  enabled?: VolatileConfig<boolean>;
 }
 
-/** Fully resolved configuration. */
+/** Fully resolved configuration. Volatile fields keep their live handles; read them through `liveValue`. */
 export interface ResolvedBridgeConfig {
   transport: 'http' | 'stdio';
   host: string;
   port: number;
-  resultMaxChars: number;
-  resultMaxItems: number;
-  sessionMaxItems: number;
-  sessionMaxChars: number;
-  logLevel: LogLevel;
-  autoApproveEscalations: boolean;
+  resultMaxChars: VolatileConfig<number>;
+  resultMaxItems: VolatileConfig<number>;
+  sessionMaxItems: VolatileConfig<number>;
+  sessionMaxChars: VolatileConfig<number>;
+  logLevel: VolatileConfig<LogLevel>;
+  autoApproveEscalations: VolatileConfig<boolean>;
+  enabled: VolatileConfig<boolean>;
   dshHome: string;
 }
 
@@ -152,6 +159,7 @@ export function resolveConfig(
     sessionMaxChars: input.sessionMaxChars ?? CONFIG_DEFAULTS.sessionMaxChars,
     logLevel: input.logLevel ?? CONFIG_DEFAULTS.logLevel,
     autoApproveEscalations: input.autoApproveEscalations ?? CONFIG_DEFAULTS.autoApproveEscalations,
+    enabled: input.enabled ?? CONFIG_DEFAULTS.enabled,
     dshHome,
   };
 }

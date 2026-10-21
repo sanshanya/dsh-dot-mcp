@@ -169,6 +169,13 @@ export class WaitPlane {
       ...(waiting.approvals[0] === undefined ? {} : { approval: waiting.approvals[0] }),
       ...(waiting.questions[0] === undefined ? {} : { question: waiting.questions[0] }),
       progress_delta: progressDelta,
+      heartbeat_at: new Date().toISOString(),
+      // Cursor health (P1-04): a replayed since_seq that fell out of the
+      // retention window reports expired + the oldest still-answerable seq,
+      // instead of silently answering from the buffer's head.
+      ...(sinceSeq === undefined || view.events[0] === undefined || sinceSeq >= view.events[0].seq
+        ? {}
+        : { cursor: { expired: true, oldest_seq: view.events[0].seq } }),
     };
   }
 }

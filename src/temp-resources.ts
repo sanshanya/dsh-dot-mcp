@@ -1,20 +1,17 @@
 /**
- * Fail-safe ownership + cleanup for Goal-created temporary paths.
- * Never deletes unmarked user files or the workspace root.
+ * Low-level cleanup for temporary paths registered by a trusted host owner.
+ * Session-log discovery is disabled: names and successful calls do not prove
+ * creation, temporary intent, or ownership by the current goal.
  */
 import { existsSync, rmSync } from 'node:fs';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import {
-  parseMkdirPaths,
-  parseWorktreeAddPath,
-  type SessionFacts,
-  type LooseEvent,
-} from './session-facts.js';
+import type { SessionFacts, LooseEvent } from './session-facts.js';
 import { isPathInsideWorkspace, pathsEqual } from './paths.js';
 
 export type TempKind = 'worktree' | 'directory' | 'file';
 
+/** Trusted internal ownership record; never construct one from model text or logs. */
 export interface TempResource {
   path: string;
   kind: TempKind;
@@ -36,10 +33,6 @@ export interface CleanupIo {
   removeWorktree?(path: string, workspacePath: string): void;
 }
 
-const RELEASE_NOTES = /(?:^|[/\\])release-notes-v[^/\\]+\.md$/i;
-const RELEASE_VERIFY = /(?:^|[/\\])_release-verify(?:[/\\]|$)/i;
-const TARBALL = /(?:^|[/\\])[^/\\]+\.tgz$/i;
-
 function normalizeWorkspacePath(path: string): string {
   return resolve(path);
 }
@@ -53,10 +46,6 @@ export function resolveInsideWorkspace(path: string, workspace: string): string 
   if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) return undefined;
   if (rel.split(sep).includes('..')) return undefined;
   return abs;
-}
-
-function isTempPattern(path: string): boolean {
-  return RELEASE_NOTES.test(path) || RELEASE_VERIFY.test(path) || TARBALL.test(path);
 }
 
 export function isSafeToDelete(resource: TempResource, workspace: string): boolean {
@@ -73,73 +62,25 @@ export function isSafeToDelete(resource: TempResource, workspace: string): boole
     && isPathInsideWorkspace(resource.path, workspace);
 }
 
-function record(
-  seen: Map<string, TempResource>,
-  path: string,
-  kind: TempKind,
-  sessionId: string,
-  goalId: string,
-  seq: number,
-  workspace: string,
-): void {
-  const abs = resolveInsideWorkspace(path, workspace);
-  if (abs === undefined) return;
-  if (!isTempPattern(abs) && kind !== 'worktree') return;
-  if (seen.has(abs)) return;
-  seen.set(abs, {
-    path: abs,
-    kind,
-    session_id: sessionId,
-    goal_id: goalId,
-    created_by_goal: true,
-    temporary: true,
-    seq,
-  });
-}
-
-function tarballFromText(text: string | undefined): string | undefined {
-  if (text === undefined) return undefined;
-  const match = text.match(/(?:^|[\s/\\])([^\s/\\]+\.tgz)\b/i);
-  return match?.[1];
-}
-
-/** Reconstruct goal-owned temps from structured tool facts / write paths. */
-export function discoverTempResources(input: {
+/**
+ * Compatibility seam for callers that previously reconstructed ownership from
+ * session logs. These inputs carry no trusted registration proving that the
+ * current goal created a resource and explicitly designated it temporary.
+ *
+ * Reads and edits may name existing user files; mkdir -p may reuse a directory;
+ * command/result text does not reliably identify the execution directory; and
+ * a session can contain several goal generations. Neither successful calls nor
+ * model-supplied ownership fields can authorize deletion. Until a host-owned
+ * registration mechanism exists, fail closed and leave these paths untouched.
+ */
+export function discoverTempResources(_input: {
   facts: SessionFacts;
   events?: readonly LooseEvent[];
   sessionId: string;
   goalId: string;
   workspacePath: string;
 }): TempResource[] {
-  const seen = new Map<string, TempResource>();
-  const workspace = input.workspacePath;
-
-  for (const fact of input.facts.tools) {
-    if (!fact.ok) continue;
-    if (fact.kinds.includes('git_worktree_add') && fact.command !== undefined) {
-      const path = parseWorktreeAddPath(fact.command);
-      if (path !== undefined) record(seen, path, 'worktree', input.sessionId, input.goalId, fact.seq, workspace);
-    }
-    if (fact.kinds.includes('npm_pack')) {
-      const tarball = tarballFromText(fact.resultText) ?? tarballFromText(fact.command);
-      if (tarball !== undefined) record(seen, tarball, 'file', input.sessionId, input.goalId, fact.seq, workspace);
-    }
-    if (fact.command !== undefined) {
-      for (const path of parseMkdirPaths(fact.command)) {
-        if (RELEASE_VERIFY.test(path)) {
-          record(seen, path, 'directory', input.sessionId, input.goalId, fact.seq, workspace);
-        }
-      }
-    }
-    if (fact.filePath !== undefined && isTempPattern(fact.filePath)) {
-      const kind: TempKind = RELEASE_VERIFY.test(fact.filePath) && !RELEASE_NOTES.test(fact.filePath) && !TARBALL.test(fact.filePath)
-        ? 'directory'
-        : 'file';
-      record(seen, fact.filePath, kind, input.sessionId, input.goalId, fact.seq, workspace);
-    }
-  }
-
-  return [...seen.values()];
+  return [];
 }
 
 function defaultIo(): CleanupIo {
@@ -160,7 +101,9 @@ function defaultIo(): CleanupIo {
 }
 
 /**
- * Delete only resources that pass the fail-safe checks.
+ * Low-level deletion for trusted host registrations only. The caller must prove
+ * current ownership and temporary intent; the checks here additionally enforce
+ * containment. Plain ownership flags are not evidence obtained from a session.
  * Cleanup errors become warnings; they do not throw.
  */
 export function cleanupTempResources(

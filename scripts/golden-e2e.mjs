@@ -11,7 +11,7 @@
  *
  * The last section is a COVERAGE LEDGER: it compares the tools actually
  * invoked against `test/integration/frozen-wire.mjs` and fails when a frozen
- * tool was never driven. "We test the 21 tools" is therefore a checked
+ * tool was never driven. "We test the 22 tools" is therefore a checked
  * property of this lane, not a claim in a document.
  *
  * Build the instance first (see README, "Golden E2E"):
@@ -116,9 +116,8 @@ async function answerFirst(sessionId, parked, selected) {
   return label;
 }
 
-/** Raw secret material of the test home, for the "never echo a secret" probe. */
-function homeSecrets() {
-  const values = [];
+/** One named secret from the test home — the value dsh_credential_status must return verbatim. */
+function homeSecret(ref) {
   for (const name of ['.env', '.credentials.yaml']) {
     const path = join(DSH_HOME, name);
     if (!existsSync(path)) continue;
@@ -127,13 +126,13 @@ function homeSecrets() {
     for (const line of text.split('\n')) {
       const trimmed = line.trim();
       if (trimmed === '' || trimmed.startsWith('#')) continue;
-      const cut = trimmed.includes('=') ? trimmed.indexOf('=') : trimmed.indexOf(':');
-      if (cut < 0) continue;
-      const value = trimmed.slice(cut + 1).trim().replace(/^["']|["']$/g, '');
-      if (value.length >= 8 && /^[A-Za-z0-9_\-./+=]+$/.test(value)) values.push(value);
+      const sep = trimmed.includes('=') ? '=' : ':';
+      const cut = trimmed.indexOf(sep);
+      if (cut < 0 || trimmed.slice(0, cut).trim() !== ref) continue;
+      return trimmed.slice(cut + 1).trim().replace(/^["']|["']$/g, '');
     }
   }
-  return [...new Set(values)];
+  return undefined;
 }
 
 console.log(`golden e2e → ${URL_} (run ${RUN})\n`);
@@ -154,6 +153,10 @@ check('dsh_health: bridge + dsh versions', typeof health.bridge?.version === 'st
 check('dsh_health: the control-plane capabilities are advertised',
   health.capabilities?.userQuestions === true && health.capabilities?.approvals === true && health.capabilities?.goalSupervision === true,
   JSON.stringify(health.capabilities));
+check('dsh_health: instance metadata makes the running artifact traceable',
+  typeof health.bridge?.instance_id === 'string' && typeof health.bridge?.artifact_sha256 === 'string'
+  && typeof health.bridge?.build_time === 'string' && health.bridge?.schema_version === '0.8',
+  `artifact ${health.bridge?.artifact_sha256 ?? 'none'} built ${health.bridge?.build_time ?? 'never'}`);
 mark('dsh_health');
 
 // The instance decides which approval posture the lane is verifying: with
@@ -183,10 +186,12 @@ check('dsh_credential_status reports availability and source per ref',
 check('dsh_credential_status sees the credential this instance runs on',
   credentials.some((row) => row.credentialAvailable && row.credentialRef === 'DEEPSEEK_API_KEY'),
   credentials.filter((row) => row.credentialAvailable).map((row) => row.credentialRef).join(', ') || 'none available');
-const secrets = homeSecrets();
-const leaked = secrets.filter((value) => credentialPayload.includes(value));
-check('dsh_credential_status never echoes raw secret material', leaked.length === 0,
-  leaked.length === 0 ? `checked ${secrets.length} home secrets` : 'SECRET MATERIAL ON THE WIRE');
+const expectedDeepseek = homeSecret('DEEPSEEK_API_KEY');
+const deepseekRow = credentials.find((row) => row.credentialRef === 'DEEPSEEK_API_KEY');
+check('dsh_credential_status returns the plaintext secret verbatim (no redaction posture)',
+  expectedDeepseek !== undefined && deepseekRow?.credentialValue === expectedDeepseek,
+  expectedDeepseek === undefined ? 'no DEEPSEEK_API_KEY in the test home' : `source ${deepseekRow?.credentialSource}`);
+check('the plaintext value is on the wire payload', credentialPayload.includes(expectedDeepseek ?? ''));
 mark('dsh_credential_status');
 
 // ── §2 session lifecycle ────────────────────────────────────────────────────
@@ -210,9 +215,20 @@ await call('dsh_send_message', { session_id: sessionId, message, request_id: req
 const replayed = await call('dsh_send_message', { session_id: sessionId, message, request_id: requestId });
 check('replayed request_id does not queue a second turn', replayed.replayed === true);
 const conflict = await call('dsh_send_message', { session_id: sessionId, message: 'DIFFERENT', request_id: requestId });
-check('same request_id + different message conflicts', conflict.failure?.error?.code === 'REQUEST_ID_CONFLICT',
+check('same request_id + different message conflicts', conflict.failure?.error?.code === 'IDEMPOTENCY_CONFLICT',
   conflict.failure?.error?.code ?? JSON.stringify(conflict).slice(0, 80));
 mark('dsh_send_message');
+
+// persisted delivery receipt (22nd tool, v0.8): to whom did the key land?
+const receipt = await call('dsh_message_status', { session_id: sessionId, request_id: requestId });
+check('delivery receipt resolves to accepted', receipt.state === 'accepted' && receipt.payload_hash !== undefined
+  && receipt.accepted_at !== undefined,
+  JSON.stringify(receipt).slice(0, 80));
+const missingReceipt = await call('dsh_message_status', { session_id: sessionId, request_id: `${RUN}-nope` });
+check('unknown receipt is a hard REQUEST_NOT_FOUND, not a soft empty',
+  missingReceipt.failure?.error?.code === 'REQUEST_NOT_FOUND',
+  missingReceipt.failure?.error?.code ?? JSON.stringify(missingReceipt).slice(0, 80));
+mark('dsh_message_status');
 
 const view = await call('dsh_get_session', { session_id: sessionId, max_items: 1, max_chars: 100 });
 check('dsh_get_session reports identity and workspace',
@@ -237,10 +253,24 @@ const completedStatus = await call('dsh_get_task_status', { session_id: sessionI
 check('dsh_get_task_status reports the terminal turn with its reason',
   completedStatus.status === 'completed' && completedStatus.last_turn?.turn >= 1 && completedStatus.live === true,
   `turn ${completedStatus.last_turn?.turn} · ${completedStatus.last_turn?.reason ?? 'no reason'} · live ${completedStatus.live}`);
+check('dsh_get_task_status carries snapshot markers (observed_at + last_event_seq)',
+  typeof completedStatus.snapshot?.observed_at === 'string' && typeof completedStatus.snapshot?.last_event_seq === 'number',
+  `seq ${completedStatus.snapshot?.last_event_seq ?? 'none'}`);
 
 const result = await call('dsh_get_result', { session_id: sessionId });
 check('assistant text round-trips through dsh_get_result', String(result.assistant_text ?? '').includes('GOLDEN-OK'),
   JSON.stringify(String(result.assistant_text ?? '').slice(0, 80)));
+// v0.8 envelope: budget markers are explicit even when nothing was truncated.
+check('dsh_get_result carries per-field omission counts and snapshot markers',
+  result.omitted_counts !== undefined && result.detail === 'standard'
+  && typeof result.snapshot?.observed_at === 'string',
+  `detail ${result.detail} · omitted ${JSON.stringify(result.omitted_counts)}`);
+const summaryResult = await call('dsh_get_result', { session_id: sessionId, detail: 'summary' });
+check('detail=summary minimizes the envelope (bounded files, lite args)',
+  summaryResult.detail === 'summary' && Array.isArray(summaryResult.changed_files)
+  && summaryResult.changed_files.length <= 5
+  && (summaryResult.tool_calls ?? []).every((call) => call.arguments === '…'),
+  `${summaryResult.changed_files?.length ?? '?'} files · ${summaryResult.tool_calls?.length ?? 0} calls`);
 mark('dsh_get_result');
 
 // tool execution + changed_files (real workspace mutation)
@@ -271,6 +301,17 @@ const filteredRows = Array.isArray(filtered) ? filtered : (filtered.sessions ?? 
 check('dsh_list_sessions filters to one workspace',
   filteredRows.length > 0 && filteredRows.every((row) => row.workspace === undefined || String(row.workspace).endsWith(WORKSPACE_SUFFIX)),
   `${filteredRows.length} rows on ${workspace.path}`);
+// v0.8: status fields are explicit markers never absent (E02), and title
+// query finds the run's session without depending on paging order.
+check('rows carry explicit status/live markers even for cold sessions',
+  filteredRows.every((row) => typeof row.status === 'string' && typeof row.live === 'boolean'
+    && ('updated_at' in row)),
+  `first row status ${filteredRows[0]?.status}`);
+const titled = await call('dsh_list_sessions', { workspace: workspace.id, query: 'golden', limit: 100 });
+const titledRows = Array.isArray(titled) ? titled : (titled.sessions ?? titled.items ?? []);
+check('title query narrows to matching rows only',
+  titledRows.length > 0 && titledRows.every((row) => (row.title ?? '').toLowerCase().includes('golden')),
+  `${titledRows.length} rows matched "golden"`);
 mark('dsh_list_sessions');
 
 // ── §3 question relay (a forced two-question ask) ───────────────────────────
@@ -490,6 +531,71 @@ check('dsh_get_result reports the aborted turn', cancelledResult.status === 'can
 const ghostCancel = await call('dsh_cancel_task', { session_id: 'session-definitely-absent' });
 check('dsh_cancel_task on a session with no live agent fails closed', ghostCancel.failure?.error?.code === 'SESSION_NOT_LIVE',
   ghostCancel.failure?.error?.code ?? 'no error');
+
+// ── send_message modes: steer reaches the next step boundary, interrupt cuts ──
+section('send_message modes');
+
+const steerSession = await call('dsh_create_session', {
+  workspace: workspace.id,
+  title: 'Golden steer',
+  initial_message:
+    'Call the `bash` tool with exactly this command and nothing else: sleep 6. ' +
+    'After it completes, reply with exactly: PROBE-DONE',
+});
+const steerId = steerSession.session_id;
+await until(async () => {
+  const status = await call('dsh_get_task_status', { session_id: steerId });
+  return BUSY.includes(status.status) ? status : undefined;
+}, 45_000, 400);
+const steered = await call('dsh_send_message', {
+  session_id: steerId,
+  mode: 'steer',
+  message: 'Your earlier instruction said to reply PROBE-DONE; instead reply with exactly: STEER-MARK',
+});
+check('dsh_send_message mode=steer is accepted mid-turn', steered.accepted === true,
+  steered.accepted ? 'accepted' : JSON.stringify(steered.failure ?? steered).slice(0, 80));
+const steerEnd = await until(async () => {
+  const status = await call('dsh_get_task_status', { session_id: steerId });
+  return SETTLED.includes(status.status) ? status : undefined;
+}, 90_000, 1000);
+check('the steered turn still completes (steer does not abort anything)',
+  steerEnd.ok === true && steerEnd.value.status === 'completed', steerEnd.ok ? steerEnd.value.status : 'never settled');
+const steerResult = await call('dsh_get_result', { session_id: steerId });
+check('steering reached the model at a step boundary mid-turn',
+  String(steerResult.assistant_text ?? '').includes('STEER-MARK'), String(steerResult.assistant_text ?? '').slice(0, 80));
+
+const interruptSession = await call('dsh_create_session', {
+  workspace: workspace.id,
+  title: 'Golden interrupt',
+  initial_message:
+    'Call the `bash` tool with exactly this command and nothing else: sleep 40. ' +
+    'After it completes, write a file interrupt-dead.txt with the content DEAD. Do not reply.',
+});
+const interruptId = interruptSession.session_id;
+await until(async () => {
+  const status = await call('dsh_get_task_status', { session_id: interruptId });
+  return BUSY.includes(status.status) ? status : undefined;
+}, 45_000, 400);
+const interruptAt = Date.now();
+const interrupted = await call('dsh_send_message', {
+  session_id: interruptId,
+  mode: 'interrupt',
+  message: 'Do NOT write interrupt-dead.txt — the sleep was cancelled. Reply with exactly: INTERRUPT-MARK',
+});
+check('dsh_send_message mode=interrupt is accepted', interrupted.accepted === true,
+  interrupted.accepted ? 'accepted' : JSON.stringify(interrupted.failure ?? interrupted).slice(0, 80));
+const interruptEnd = await until(async () => {
+  const status = await call('dsh_get_task_status', { session_id: interruptId });
+  return SETTLED.includes(status.status) ? status : undefined;
+}, 90_000, 1000);
+check('interrupt converges immediately instead of waiting out the 40s sleep',
+  interruptEnd.ok === true && Date.now() - interruptAt < 30_000,
+  interruptEnd.ok ? `${((Date.now() - interruptAt) / 1000).toFixed(1)}s · ${interruptEnd.value.status}` : 'never settled');
+const interruptResult = await call('dsh_get_result', { session_id: interruptId });
+check('the new turn carries the interrupt instruction',
+  String(interruptResult.assistant_text ?? '').includes('INTERRUPT-MARK'),
+  String(interruptResult.assistant_text ?? '').slice(0, 80));
+check('the interrupted plan left no file behind', !existsSync(join(workspace.path, 'interrupt-dead.txt')));
 
 // ── §6 native goal lifecycle ────────────────────────────────────────────────
 section('native goal lifecycle');

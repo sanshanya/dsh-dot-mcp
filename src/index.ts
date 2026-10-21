@@ -6,7 +6,7 @@
 import { Context } from '@deepseek-ai/cordis';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { Bridge } from './bridge.js';
-import { ConfigSchema, resolveConfig, type BridgeConfigInput, type ResolvedBridgeConfig } from './config.js';
+import { ConfigSchema, liveValue, resolveConfig, type BridgeConfigInput, type ResolvedBridgeConfig } from './config.js';
 import { createBridgeLogger } from './log.js';
 import { createMcpServer } from './mcp.js';
 import { startHttpServer, type HttpServerHandle } from './http.js';
@@ -35,6 +35,19 @@ export function apply(ctx: Context, config: BridgeConfigInput): void {
   const bridge = new Bridge(ctx, cfg, log);
   bridge.start();
 
+  // Settings presentation: when the DSH settings service exists (web/headless
+  // profiles), describe this row's Config so the GUI can read and edit the
+  // volatile fields (budgets, log level, auto-approve switch) live.
+  interface SettingsPresentation {
+    configure(options: { auto: boolean }, owner?: unknown): () => void;
+  }
+  ctx.inject(['settings'], (child) => {
+    child.effect(() => {
+      const settings = (child as unknown as { settings: SettingsPresentation }).settings;
+      return settings.configure({ auto: false }, ctx.fiber);
+    });
+  });
+
   let mcpServer: ReturnType<typeof createMcpServer> | undefined;
   let stdioTransport: StdioServerTransport | undefined;
   let stdioReady: Promise<void> | undefined;
@@ -54,6 +67,12 @@ export function apply(ctx: Context, config: BridgeConfigInput): void {
       () => createMcpServer(bridge),
       { host: cfg.host, port: cfg.port },
       log,
+      {
+        // Live gate: the settings panel flips this volatile field to suspend
+        // the MCP surface without unbinding the port (see GET /status).
+        isEnabled: () => liveValue(cfg.enabled) !== false,
+        statusReport: () => bridge.health(),
+      },
     );
     void httpReady.catch((error) => {
       log.error(`failed to start MCP HTTP server: ${error instanceof Error ? error.message : String(error)}`);

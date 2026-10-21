@@ -17,13 +17,20 @@ export interface LooseEvent {
 
 export interface ToolFact {
   seq: number;
+  /** Call sequence lets a read-back prove it started after the mutation settled. */
+  callSeq?: number;
   callId: string;
   name: string;
   kinds: ActionKind[];
   ok: boolean;
   errorCode?: string;
   resultText?: string;
+  /** The preview retains whole lines from both ends; omitted middle is not evidence. */
+  resultTruncated?: boolean;
+  exitCode?: number;
   command?: string;
+  /** Explicit tool execution directory; omitted means the session workspace. */
+  workdir?: string;
   filePath?: string;
 }
 
@@ -36,10 +43,15 @@ export interface SessionFacts {
 
 const RESULT_TEXT_CAP = 800;
 const COMMAND_KEYS = ['command', 'cmd', 'script', 'command_line'];
+/**
+ * Path-carrying argument keys — ONE list. PATH_ARG_KEYS (changed-files scan,
+ * edit tools only) is this list minus the call-args-only 'target'.
+ */
 const PATH_KEYS = [
   'file_path', 'path', 'filepath', 'target',
   'old_path', 'new_path', 'src', 'dest', 'old_file', 'new_file',
 ];
+const PATH_ARG_KEYS = PATH_KEYS.filter((key) => key !== 'target');
 
 
 function extractFilePath(args: Record<string, unknown>): string | undefined {
@@ -116,9 +128,8 @@ export function parseMkdirPaths(command: string): string[] {
 }
 
 function resultTextOf(data: Record<string, unknown>): string {
-  const message = data.message as { content?: unknown } | undefined;
-  const content = message?.content;
-  if (typeof content === 'string') return content.slice(0, RESULT_TEXT_CAP);
+  const content = asRecord(data.message)?.content;
+  if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
   const parts: string[] = [];
   for (const block of content) {
@@ -130,18 +141,65 @@ function resultTextOf(data: Record<string, unknown>): string {
       else if (typeof rec.text === 'string') parts.push(rec.text);
     }
   }
-  return parts.join('\n').slice(0, RESULT_TEXT_CAP);
+  return parts.join('\n');
+}
+
+function boundedResultText(text: string): string {
+  if (text.length <= RESULT_TEXT_CAP) return text;
+  const marker = '\n…[truncated]\n';
+  const headLimit = 200;
+  const tailStart = text.length - (RESULT_TEXT_CAP - headLimit - marker.length);
+  // Never turn a cut line into a fake summary line. Test-runner totals normally
+  // live at the tail, which the previous head-only preview silently discarded.
+  const headEnd = text.lastIndexOf('\n', headLimit);
+  const tailEnd = text.indexOf('\n', tailStart - 1);
+  return text.slice(0, headEnd < 0 ? 0 : headEnd) + marker
+    + (tailEnd < 0 ? '' : text.slice(tailEnd + 1));
 }
 
 function resultIsError(data: Record<string, unknown>): boolean {
-  if (data.error !== undefined) return true;
-  const message = data.message as { content?: unknown } | undefined;
+  if (data.error !== undefined || data.isError === true) return true;
+  const message = asRecord(data.message);
+  if (message?.isError === true) return true;
   const content = message?.content;
-  if (Array.isArray(content)) {
-    const first = content[0] as { isError?: boolean } | undefined;
-    if (first?.isError === true) return true;
-  }
-  return false;
+  return Array.isArray(content) && content.some(block => asRecord(block)?.isError === true);
+}
+
+/**
+ * The owned runner's appended exit marker — ONE source for extraction
+ * (resultExitCode below) and cleaning (result-schema's cleanToolOutput).
+ */
+const EXIT_MARKER_RE = /^(?:\[exit code:\s*(-?\d+)\]|(?:exit code|process exited with code):?\s*(-?\d+))\s*$/gmi;
+
+/** Remove every runner exit-marker line from a result preview. */
+export function stripExitMarkers(text: string): string {
+  return text.replace(EXIT_MARKER_RE, '').trimEnd();
+}
+
+function resultExitCode(data: Record<string, unknown>, text: string): number | undefined {
+  const message = asRecord(data.message);
+  const explicit = data.exitCode ?? message?.exitCode;
+  if (typeof explicit === 'number' && Number.isSafeInteger(explicit)) return explicit;
+  // Parse the FULL text, not the bounded preview, and use the last marker
+  // when stdout also contained one.
+  const markers = [...text.matchAll(EXIT_MARKER_RE)];
+  const last = markers[markers.length - 1];
+  if (last === undefined) return undefined;
+  const code = Number(last[1] ?? last[2]);
+  return Number.isSafeInteger(code) ? code : undefined;
+}
+
+/**
+ * Shared tool/process outcome for facts, turn reads and polling deltas.
+ * Unknown process exits retain tool-level success without inventing exit zero;
+ * malformed top-level data fails closed. Always inspect text before truncation.
+ */
+export function toolResultOutcome(data: unknown): { ok: boolean; exitCode?: number } {
+  const record = asRecord(data);
+  if (record === undefined) return { ok: false };
+  const exitCode = resultExitCode(record, resultTextOf(record));
+  const ok = !resultIsError(record) && (exitCode === undefined || exitCode === 0);
+  return { ok, ...(exitCode === undefined ? {} : { exitCode }) };
 }
 
 function resultErrorCode(data: Record<string, unknown>): string | undefined {
@@ -160,7 +218,7 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 /** Fold tool/call + tool/result + todo/write + turn/end into facts. */
 export function foldSessionFacts(events: readonly LooseEvent[]): SessionFacts {
   const tools: ToolFact[] = [];
-  const open = new Map<string, { seq: number; name: string; command?: string; filePath?: string; kinds: ActionKind[] }>();
+  const open = new Map<string, { seq: number; name: string; command?: string; workdir?: string; filePath?: string; kinds: ActionKind[] }>();
   let todos: { content: string; status: string }[] | undefined;
   let lastTurnReason: string | undefined;
   let lastSeq: number | undefined;
@@ -189,6 +247,7 @@ export function foldSessionFacts(events: readonly LooseEvent[]): SessionFacts {
       const rawArgs = typeof data.arguments === 'string' ? data.arguments : '';
       const args = rawArgs === '' ? undefined : parseArgsJson(rawArgs);
       const command = args === undefined ? undefined : extractCommand(args);
+      const workdir = typeof args?.workdir === 'string' && args.workdir.trim() !== '' ? args.workdir : undefined;
       const filePath = args === undefined ? undefined : extractFilePath(args);
       const kinds = command === undefined ? [] : classifyCommand(command);
       if (kinds.length === 0) kinds.push('unknown');
@@ -197,6 +256,7 @@ export function foldSessionFacts(events: readonly LooseEvent[]): SessionFacts {
           seq: event.seq,
           name,
           ...(command === undefined ? {} : { command }),
+          ...(workdir === undefined ? {} : { workdir }),
           ...(filePath === undefined ? {} : { filePath }),
           kinds,
         });
@@ -208,18 +268,23 @@ export function foldSessionFacts(events: readonly LooseEvent[]): SessionFacts {
       const opened = callId === undefined ? undefined : open.get(callId);
       if (opened !== undefined && callId !== undefined) {
         open.delete(callId);
-        const text = resultTextOf(data);
-        const ok = !resultIsError(data);
+        const fullText = resultTextOf(data);
+        const text = boundedResultText(fullText);
+        const { ok, exitCode } = toolResultOutcome(data);
         const errorCode = resultErrorCode(data);
         tools.push({
           seq: event.seq,
+          callSeq: opened.seq,
           callId,
           name: opened.name,
           kinds: opened.kinds,
           ok,
           ...(errorCode === undefined ? {} : { errorCode }),
           ...(text === '' ? {} : { resultText: text }),
+          ...(fullText.length > RESULT_TEXT_CAP ? { resultTruncated: true } : {}),
+          ...(exitCode === undefined ? {} : { exitCode }),
           ...(opened.command === undefined ? {} : { command: opened.command }),
+          ...(opened.workdir === undefined ? {} : { workdir: opened.workdir }),
           ...(opened.filePath === undefined ? {} : { filePath: opened.filePath }),
         });
       }
@@ -302,6 +367,44 @@ export function assistantTextForTurn(events: readonly SessionEvent[], turn: numb
   return parts.join('\n');
 }
 
+/** One past-terminal turn worth flagging in audit trails (never 'completed'). */
+export interface FailureSummary {
+  turn: number;
+  seq: number;
+  kind: string;
+  code?: string;
+  message?: string;
+}
+
+/**
+ * The newest non-completed turn/end strictly before `beforeTurn`. A later
+ * healthy turn must not delete the failure trail from the wire (P0-03), but
+ * note this answers from the event buffer's tail: old failures beyond the
+ * retention window are gone by design of the runtime, not by omission here.
+ */
+export function lastFailureBefore(events: readonly SessionEvent[], beforeTurn?: number): FailureSummary | undefined {
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const event = events[i];
+    if (event.type !== 'turn/end') continue;
+    const data = asRecord(event.data);
+    if (data === undefined || typeof data.turn !== 'number') continue;
+    if (beforeTurn !== undefined && (data.turn as number) >= beforeTurn) continue;
+    const reason = asRecord(data.reason);
+    const kind = typeof reason?.kind === 'string' ? reason.kind as string : 'unknown';
+    if (kind === 'completed') continue;
+    const error = asRecord(reason?.error);
+    return {
+      turn: data.turn as number,
+      seq: event.seq,
+      kind,
+      ...(error === undefined || typeof error.code !== 'string'
+        ? {}
+        : { code: error.code as string, ...(typeof error.message === 'string' ? { message: error.message as string } : {}) }),
+    };
+  }
+  return undefined;
+}
+
 /** One model-requested tool invocation inside a turn, paired with its result. */
 export interface ToolCallInfo {
   callId: string;
@@ -317,18 +420,19 @@ export function toolCallsForTurn(events: readonly SessionEvent[], turn: number, 
   const calls = new Map<string, ToolCallInfo>();
   const order: string[] = [];
   for (const event of events) {
-    if (event.data === undefined) continue;
-    const data = event.data as Record<string, unknown>;
-    if (event.type === 'tool/call' && data.turn === turn) {
-      const callId = data.callId as string;
+    const data = asRecord(event.data);
+    if (data === undefined) continue;
+    if (event.type === 'tool/call' && data.turn === turn && typeof data.callId === 'string') {
+      const callId = data.callId;
       calls.set(callId, { callId, name: data.name as string, arguments: data.arguments as string });
       order.push(callId);
     } else if (event.type === 'tool/result' && data.turn === turn) {
-      const callId = (data.message as { source?: { callId?: string } })?.source?.callId as string | undefined;
+      const source = asRecord(asRecord(data.message)?.source);
+      const callId = typeof source?.callId === 'string' ? source.callId : undefined;
       if (callId !== undefined) {
         const call = calls.get(callId);
         if (call !== undefined) {
-          call.isError = (data.message as { content?: { isError?: boolean }[] })?.content?.[0]?.isError ?? false;
+          call.isError = !toolResultOutcome(data).ok;
           if (data.error !== undefined) call.error = data.error as { name: string; code: string };
         }
       }
@@ -342,8 +446,6 @@ const EDIT_TOOL_NAMES = new Set([
   'write', 'edit', 'str_replace', 'insert', 'replace', 'apply_patch', 'str-replace-editor',
   'rename', 'move', 'delete', 'rm', 'cp', 'mv',
 ]);
-const PATH_ARG_KEYS = ['file_path', 'path', 'filepath', 'old_path', 'new_path', 'src', 'dest', 'old_file', 'new_file'];
-
 /**
  * Files edit tools named, in first-seen order (data-driven from the log).
  * turn undefined = the whole log; otherwise only that turn (audit B#3: this
@@ -417,5 +519,6 @@ export function summarizeMessages(
 /** Last event timestamp (ms) or undefined for an empty log. */
 export function lastEventTime(events: readonly SessionEvent[]): string | undefined {
   const last = events[events.length - 1];
-  return last === undefined ? undefined : new Date(last.time).toISOString();
+  if (last === undefined || !Number.isFinite(last.time)) return undefined;
+  return new Date(last.time).toISOString();
 }

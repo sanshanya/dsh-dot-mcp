@@ -99,6 +99,7 @@ test('GAP-B2: a reused request_id with different intent is a conflict, not a rep
   const goals = makeGoalsService();
   const bridge = makeBridge(runningAgent('s2'), { goals });
   goals.create({ id: 's2' }, { objective: 'fixture goal' });
+  goals.__disarm({ id: 's2' });
 
   const first = await bridge.updateGoal({
     session_id: 's2',
@@ -131,6 +132,7 @@ test('GAP-B2: request_id replay pre-empts a native resume that would now fail', 
   const goals = makeGoalsService();
   const bridge = makeBridge(runningAgent('s3'), { goals });
   goals.create({ id: 's3' }, { objective: 'fixture goal' });
+  goals.__disarm({ id: 's3' });
 
   await bridge.resumeGoal('s3', 'req-retry');
 
@@ -207,7 +209,7 @@ function countingAgent(id) {
   return agent;
 }
 
-test('GAP-B1: send_message is idempotent only when a request_id is supplied', async () => {
+test('GAP-B1: send_message is idempotent only when a request_id is supplied (conflict code IDEMPOTENCY_CONFLICT)', async () => {
   const agent = countingAgent('s5');
   const bridge = makeBridge(agent);
 
@@ -227,7 +229,7 @@ test('GAP-B1: send_message is idempotent only when a request_id is supplied', as
 
   await assert.rejects(
     () => bridge.sendMessage('s5', 'a different message', 'send-key-1'),
-    (error) => error.code === 'REQUEST_ID_CONFLICT',
+    (error) => error.code === 'IDEMPOTENCY_CONFLICT'
   );
 });
 

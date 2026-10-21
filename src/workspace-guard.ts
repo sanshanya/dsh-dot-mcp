@@ -20,6 +20,28 @@ export interface MutationRecord {
   timestamp: number;
 }
 
+/** Serialize bridge dispatches, not whole agent turns, for one workspace. */
+export class WorkspaceOperationQueue {
+  private readonly tails = new Map<string, Promise<void>>();
+
+  run<T>(workspacePath: string, operation: () => Promise<T>): Promise<T> {
+    const key = normalizePath(workspacePath);
+    const previous = this.tails.get(key) ?? Promise.resolve();
+    const result = previous.then(operation);
+    // A failed operation must not poison later dispatches or leave a queue entry.
+    const tail = result.then(() => {}, () => {});
+    this.tails.set(key, tail);
+    void tail.then(() => {
+      if (this.tails.get(key) === tail) this.tails.delete(key);
+    });
+    return result;
+  }
+
+  isBusy(workspacePath: string): boolean {
+    return this.tails.has(normalizePath(workspacePath));
+  }
+}
+
 export class WorkspaceConcurrencyGuard {
   private readonly locks = new Map<string, WorkspaceLockHolder>(); // normalizedPath -> lock
   private readonly sessionLocks = new Map<string, string>(); // sessionId -> normalizedPath
@@ -80,6 +102,11 @@ export class WorkspaceConcurrencyGuard {
 
   getLock(workspacePath: string): WorkspaceLockHolder | undefined {
     return this.locks.get(normalizePath(workspacePath));
+  }
+
+  getSessionLock(sessionId: string): WorkspaceLockHolder | undefined {
+    const key = this.sessionLocks.get(sessionId);
+    return key === undefined ? undefined : this.locks.get(key);
   }
 
   /** Record a mutating operation (write, commit, tag, publish) for provenance. */

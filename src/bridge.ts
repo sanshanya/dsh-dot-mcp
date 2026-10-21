@@ -6,6 +6,9 @@
  */
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent, AgentOptions, AgentSetup, ModelSelection } from '@deepseek-ai/dsh-agent';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
@@ -18,7 +21,7 @@ import {
 } from '@deepseek-ai/dsh-session';
 import { inspectPersistedSession, persistedHeader, sessionEvents } from './session-persistence-compat.js';
 import type { Workspace } from '@deepseek-ai/dsh-workspace';
-import type { ResolvedBridgeConfig } from './config.js';
+import { liveValue, type ResolvedBridgeConfig } from './config.js';
 import type { BridgeLogger } from './log.js';
 import { isTerminalStatus, type BridgeStatus } from './status.js';
 import {
@@ -38,6 +41,7 @@ import {
   assistantTextForTurn,
   collectChangedFiles,
   lastEventTime,
+  lastFailureBefore,
   lastTurnSpan,
   summarizeMessages,
   toolCallsForTurn,
@@ -45,10 +49,10 @@ import {
   type ToolCallInfo,
 } from './session-facts.js';
 import { foldSessionFacts } from './session-facts.js';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { cleanupTempResources, discoverTempResources } from './temp-resources.js';
+import { RequestIdStore } from './request-id-store.js';
+import { MessageReceiptStore, type MessageReceipt } from './message-receipts.js';
 import {
+  RequestFlights,
   RequestIdMap,
   fingerprintRequest,
   type RequestRecord,
@@ -68,10 +72,11 @@ import {
   type NativeGoalWire,
   type GoalHostContext,
 } from './goal-native.js';
-import { WorkspaceConcurrencyGuard } from './workspace-guard.js';
+import { WorkspaceConcurrencyGuard, WorkspaceOperationQueue } from './workspace-guard.js';
 import { idempotencyKindFor } from './command-classify.js';
 import { AskRelay, type WaitingState } from './ask-relay.js';
 import { buildResultSchema, type ResultSchema } from './result-schema.js';
+import { selectResultEvents } from './result-scope.js';
 import { inspectCredentials, type CredentialStatus } from './credentials.js';
 import { BRIDGE_NAME, BRIDGE_VERSION } from './version.js';
 import { pathsEqual } from './paths.js';
@@ -82,8 +87,17 @@ export { BridgeError };
 
 export interface HealthReport {
   status: string;
-  bridge: { name: string; version: string };
-  dsh: { version: string };
+  bridge: {
+    name: string;
+    version: string;
+    protocol_version: string;
+    schema_version: string;
+    instance_id: string;
+    started_at: string;
+    build_time?: string;
+    artifact_sha256?: string;
+  };
+  dsh: { version: string; source?: string; unknown_reason?: string };
   runtime: { pid: number; uptimeMs: number };
   sessions: { live: number; persisted: number; active: number };
   capabilities: {
@@ -124,6 +138,27 @@ export interface SessionView {
   last_turn?: { turn: number; reason?: string };
   todos?: { content: string; status: string }[];
   goal?: NativeGoalWire;
+  /** Read snapshot markers: same-call freshness to pair with dsh_get_result. */
+  snapshot: { observed_at: string; last_event_seq?: number };
+}
+
+interface MessageAccepted {
+  session_id: string;
+  accepted: boolean;
+  request_id?: string;
+  replayed?: boolean;
+}
+
+interface StartGoalInput {
+  workspace: string;
+  goal: string;
+  plan?: string;
+  session_id?: string;
+  request_id?: string;
+  max_goal_rounds?: number;
+  expected_revision?: number;
+  workspace_lock_override?: boolean;
+  read_only?: boolean;
 }
 
 export interface ResultView {
@@ -135,20 +170,61 @@ export interface ResultView {
   tool_calls: ToolCallInfo[];
   error?: { code: string; message: string };
   result_schema?: ResultSchema;
+  /** Requested detail level; 'standard' is the historical behavior. */
+  detail: 'summary' | 'standard' | 'full';
+  /** Number of rows dropped by a budget, per field (0 = nothing omitted). */
+  omitted_counts: { tool_calls: number; changed_files: number };
+  /** Per-field truncation marker — never truncate a JSON structure itself. */
+  truncated: { text: boolean; tool_calls: boolean; changed_files: boolean; total?: boolean };
+  /** Read snapshot markers: same-call freshness for status/result pairs (P1-03). */
+  snapshot: { observed_at: string; last_event_seq?: number };
+  /** Newest non-completed terminal turn before this one (P0-03 failure trail). */
+  last_failure?: { turn: number; seq: number; kind: string; code?: string; message?: string };
 }
 
-const require = createRequire(import.meta.url);
+/** The CLI package.json is inside the host process tree, not our node_modules. */
+function resolveDshVersion(): { version: string; source?: string; unknown_reason?: string } {
+  const candidates = [process.argv[1], process.cwd(), fileURLToPath(import.meta.url)]
+    .filter((entry): entry is string => typeof entry === 'string' && entry !== '')
+    .map((entry) => dirname(entry));
+  for (const root of candidates) {
+    try {
+      const probe = createRequire(join(root, 'probe.js'));
+      const manifest = probe.resolve('@deepseek-ai/dsh/package.json');
+      const parsed = JSON.parse(readFileSync(manifest, 'utf8')) as { version?: string };
+      if (typeof parsed.version === 'string') return { version: parsed.version, source: manifest };
+    } catch {
+      // next candidate
+    }
+  }
+  return { version: 'unknown', unknown_reason: 'the host CLI package (@deepseek-ai/dsh) is not resolvable from argv/cwd/module roots' };
+}
 
-/** DSH version string, resolved lazily from the installed package. */
-function dshVersion(): string {
+/** Stamped at build time by scripts/write-buildmeta.mjs. */
+function buildMeta(): { built_at?: string; artifact_sha256?: string } {
   try {
-    return (require('@deepseek-ai/dsh/package.json') as { version?: string }).version ?? 'unknown';
+    return JSON.parse(readFileSync(new URL('buildmeta.json', import.meta.url), 'utf8')) as { built_at?: string; artifact_sha256?: string };
   } catch {
-    return 'unknown';
+    return {};
   }
 }
 
+const INSTANCE_ID = randomUUID();
+const INSTANCE_STARTED_AT = new Date().toISOString();
+const MCP_PROTOCOL_VERSION = '2024-11-05';
+const WIRE_SCHEMA_VERSION = '0.8';
+
 /** The bridge service. One instance per plugin activation. */
+/**
+ * Workspace claim policy, named instead of the old positional booleans:
+ * `override` takes foreign locks (pauses the holder); `readOnly` claims
+ * nothing (bridge-level audit classification only — never a native concept).
+ */
+interface LockPolicy {
+  readonly override?: boolean;
+  readonly readOnly?: boolean;
+}
+
 export class Bridge {
   private readonly ctx: Context;
   private readonly cfg: ResolvedBridgeConfig;
@@ -161,10 +237,18 @@ export class Bridge {
   private started = false;
   private readonly goalRequests = new RequestIdMap();
   private readonly messageRequests = new RequestIdMap();
-  private readonly requestIdFile: string | undefined;
+  private readonly requestIdStore: RequestIdStore;
+  private readonly receiptStore: MessageReceiptStore;
+  /** dsh_send_message receipts (accepted only): restore + live appends. */
+  private readonly messageReceipts = new Map<string, MessageReceipt>();
+  private readonly goalFlights = new RequestFlights<GoalStartResult>();
+  private readonly messageFlights = new RequestFlights<MessageAccepted>();
+  private readonly agentFlights = new RequestFlights<Agent>();
+  private readonly workspaceOperations = new WorkspaceOperationQueue();
+  /** Session -> exact goal generation; a hint never survives replacement work. */
+  private readonly readOnlySessions = new Map<string, string>();
 
   readonly workspaceGuard = new WorkspaceConcurrencyGuard();
-  private readonly recordedMutationCalls = new Set<string>();
 
   /** Test hooks for bounded wait loops. */
   now: () => number = () => Date.now();
@@ -177,7 +261,7 @@ export class Bridge {
     this.relays = new AskRelay({
       isManaged: (sessionId) => this.managed.has(sessionId),
       hostCanAnswer: () => this.hostCanAnswer(),
-      autoApproveEscalations: () => this.cfg.autoApproveEscalations === true,
+      autoApproveEscalations: () => liveValue(this.cfg.autoApproveEscalations) === true,
     }, log);
 
     // The wait plane reads the facade through this seam; `now`/`sleep` are read
@@ -193,45 +277,19 @@ export class Bridge {
       sleep: (ms) => this.sleep(ms),
     });
     const home = typeof cfg.dshHome === 'string' && cfg.dshHome !== '' ? cfg.dshHome : undefined;
-    this.requestIdFile = home === undefined ? undefined : join(home, 'goal-requests.json');
-    if (this.requestIdFile !== undefined) this.loadRequestIds();
-  }
-
-  /**
-   * request_id dedup is process-local unless a dshHome is configured; with one,
-   * the map is persisted so a connector retry after a bridge restart is still
-   * recognised as a replay instead of starting the work a second time.
-   */
-  private loadRequestIds(): void {
-    if (this.requestIdFile === undefined) return;
-    try {
-      const parsed = JSON.parse(readFileSync(this.requestIdFile, 'utf8')) as { records?: unknown };
-      if (!Array.isArray(parsed.records)) return;
-      const rows = parsed.records.filter(
-        (row): row is [string, RequestRecord] => Array.isArray(row)
-          && typeof row[0] === 'string'
-          && row[1] !== null
-          && typeof row[1] === 'object'
-          && typeof (row[1] as { sessionId?: unknown }).sessionId === 'string'
-          && typeof (row[1] as { fingerprint?: unknown }).fingerprint === 'string',
-      );
-      this.goalRequests.restore(rows);
-    } catch {
-      // A missing or malformed file must never block startup.
+    this.requestIdStore = new RequestIdStore(home, (message) => this.log.warn(message));
+    this.goalRequests.restore(this.requestIdStore.load());
+    this.receiptStore = new MessageReceiptStore(home, (message) => this.log.warn(message));
+    for (const receipt of this.receiptStore.load()) {
+      this.messageReceipts.set(receipt.request_id, receipt);
+      this.messageRequests.set(receipt.request_id, { sessionId: receipt.session_id, fingerprint: receipt.payload_hash });
     }
   }
 
+  /** The fs shape lives in RequestIdStore; the map itself stays here. */
   private rememberRequestId(requestId: string, record: RequestRecord): void {
     this.goalRequests.set(requestId, record);
-    if (this.requestIdFile === undefined) return;
-    try {
-      mkdirSync(dirname(this.requestIdFile), { recursive: true });
-      const tmp = `${this.requestIdFile}.tmp`;
-      writeFileSync(tmp, JSON.stringify({ version: 1, records: this.goalRequests.entries() }), { mode: 0o600 });
-      renameSync(tmp, this.requestIdFile);
-    } catch (error) {
-      this.log.warn(`could not persist request_id state: ${error instanceof Error ? error.message : String(error)}`);
-    }
+    this.requestIdStore.save(this.goalRequests.entries());
   }
 
   // ── lifecycle ─────────────────────────────────────────────────────────────
@@ -354,8 +412,16 @@ export class Bridge {
     }
   }
 
-  /** Resolve a live agent, resuming the persisted session when needed. */
+  /** Coalesce cold loads even when callers use different request ids. */
   private async ensureAgent(sessionId: string): Promise<Agent> {
+    const live = this.ctx.agents.get(SessionId(sessionId));
+    if (live !== undefined) return live;
+    const { value } = await this.agentFlights.run(sessionId, sessionId, () => this.resumeAgent(sessionId));
+    return value;
+  }
+
+  /** Resolve a cold agent using the host's own persisted-session API. */
+  private async resumeAgent(sessionId: string): Promise<Agent> {
     const live = this.ctx.agents.get(SessionId(sessionId));
     if (live !== undefined) return live;
     const persistence = this.ctx.get('sessionPersistence');
@@ -373,12 +439,40 @@ export class Bridge {
     const presetId = inspected.events.reduce(agentPresetProjectionDefinition.apply,
       agentPresetProjectionDefinition.init(inspected.meta)) ?? undefined;
     const composition = await this.composeSetupFor(presetId);
+    // Another host entry point may have loaded the session during disk I/O.
+    const loaded = this.ctx.agents.get(SessionId(sessionId));
+    if (loaded !== undefined) return loaded;
     const { agent } = await this.ctx.agents.resume({
       resumeSessionId: SessionId(sessionId),
       agentOptions: this.agentOptions(),
       setup: composition.setup,
     });
     return agent;
+  }
+
+  private workspaceOf(view: LoadedView, sessionId: string): string {
+    const workspace = view.header.cwd;
+    if (typeof workspace !== 'string' || workspace.trim() === '') {
+      throw new BridgeError('WORKSPACE_NOT_FOUND', `session ${sessionId} has no workspace binding`);
+    }
+    return workspace;
+  }
+
+  /** No nested public mutators inside this queue: call their private bodies. */
+  private async inSessionWorkspace<T>(
+    sessionId: string,
+    operation: (workspacePath: string) => Promise<T>,
+  ): Promise<T> {
+    const view = await this.loadView(sessionId);
+    const workspace = this.workspaceOf(view, sessionId);
+    return this.workspaceOperations.run(workspace, () => operation(workspace));
+  }
+
+  private assertSessionWorkspace(sessionId: string, actual: string | undefined, expected: string): void {
+    if (actual === undefined || !pathsEqual(actual, expected)) {
+      throw new BridgeError('WORKSPACE_MISMATCH',
+        `session ${sessionId} belongs to "${actual ?? '(none)'}", not the requested workspace "${expected}"`);
+    }
   }
 
   // ── workspace boundary ────────────────────────────────────────────────────
@@ -432,10 +526,21 @@ export class Bridge {
       persisted = -1;
     }
     const workspaces = this.ctx.get('workspaceRegistry')?.list() ?? [];
+    const dsh = resolveDshVersion();
+    const meta = buildMeta();
     return {
       status: 'ok',
-      bridge: { name: BRIDGE_NAME, version: BRIDGE_VERSION },
-      dsh: { version: dshVersion() },
+      bridge: {
+        name: BRIDGE_NAME,
+        version: BRIDGE_VERSION,
+        protocol_version: MCP_PROTOCOL_VERSION,
+        schema_version: WIRE_SCHEMA_VERSION,
+        instance_id: INSTANCE_ID,
+        started_at: INSTANCE_STARTED_AT,
+        ...(meta.built_at === undefined ? {} : { build_time: meta.built_at }),
+        ...(meta.artifact_sha256 === undefined ? {} : { artifact_sha256: meta.artifact_sha256 }),
+      },
+      dsh,
       runtime: { pid: process.pid, uptimeMs: Math.round(process.uptime() * 1000) },
       sessions: {
         live: agents.length,
@@ -449,9 +554,12 @@ export class Bridge {
         agentPresets: this.ctx.get('agentPresets') !== undefined,
         userQuestions: this.relays.questionsReady,
         approvals: this.relays.approvalsReady,
-        autoApproveEscalations: this.cfg.autoApproveEscalations === true,
+        autoApproveEscalations: liveValue(this.cfg.autoApproveEscalations) === true,
         workspaces: workspaces.length,
-        webSurface: this.ctx.get('webRuntime') !== undefined,
+        // DSH 0.2.1-rc.2 renamed the web-surface marker service from
+        // `webRuntime` to `webApp`; accept either so health stays honest on
+        // whichever host generation boots us.
+        webSurface: this.ctx.get('webApp') !== undefined || this.ctx.get('webRuntime') !== undefined,
         goalSupervision: true,
       },
     };
@@ -463,95 +571,164 @@ export class Bridge {
     initialMessage?: string,
   ): Promise<SessionView> {
     const workspace = await this.resolveWorkspace(workspaceInput);
+    return this.workspaceOperations.run(workspace.path, () => this.createSessionInWorkspace(workspace, title, initialMessage));
+  }
+
+  private async createSessionInWorkspace(
+    workspace: Workspace,
+    title?: string,
+    initialMessage?: string,
+  ): Promise<SessionView> {
+    const startsTurn = initialMessage !== undefined && initialMessage.trim() !== '';
+    if (startsTurn) this.assertMutableWorkspaceAvailable(workspace.path, undefined, {});
     const sessionId = `session-${randomUUID()}`;
-    const composition = await this.composeSetupFor(undefined);
-    let agent: Agent;
-    try {
-      const handle = await this.ctx.agents.create({
-        sessionId: SessionId(sessionId),
-        agentOptions: this.agentOptions(),
-        meta: {
-          cwd: workspace.path,
-          ...(composition.agentPreset === undefined ? {} : { agentPreset: composition.agentPreset }),
-        },
-        setup: composition.setup,
-      });
-      agent = handle.agent;
-    } catch (error) {
-      throw new BridgeError(
-        'SESSION_CREATE_FAILED',
-        `failed to create DSH session in workspace "${workspace.title}": ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
-    this.adopt(sessionId);
-    try {
-      await workspace.attachSession(SessionId(sessionId));
-    } catch (error) {
-      this.log.warn(`session ${sessionId} could not attach to workspace ${workspace.id}: ${String(error)}`);
-    }
-    if (title !== undefined && title !== '') {
+    if (startsTurn) await this.takeWorkspaceLock(workspace.path, sessionId, {});
+    return this.runReleasingLock(sessionId, 'on-error', async () => {
+      const composition = await this.composeSetupFor(undefined);
+      let agent: Agent;
       try {
-        this.ctx.sessionTitle?.rename(agent.session, title);
+        const handle = await this.ctx.agents.create({
+          sessionId: SessionId(sessionId),
+          agentOptions: this.agentOptions(),
+          meta: {
+            cwd: workspace.path,
+            ...(composition.agentPreset === undefined ? {} : { agentPreset: composition.agentPreset }),
+          },
+          setup: composition.setup,
+        });
+        agent = handle.agent;
       } catch (error) {
-        this.log.warn(`session ${sessionId} title rejected: ${String(error)}`);
+        throw new BridgeError('SESSION_CREATE_FAILED',
+          `failed to create DSH session in workspace "${workspace.title}": ${error instanceof Error ? error.message : String(error)}`);
       }
-    }
-    if (initialMessage !== undefined && initialMessage.trim() !== '') {
-      agent.followup(
-        createUserMessage({
+      this.adopt(sessionId);
+      try {
+        await workspace.attachSession(SessionId(sessionId));
+      } catch (error) {
+        this.log.warn(`session ${sessionId} could not attach to workspace ${workspace.id}: ${String(error)}`);
+      }
+      if (title !== undefined && title !== '') {
+        try {
+          this.ctx.sessionTitle?.rename(agent.session, title);
+        } catch (error) {
+          this.log.warn(`session ${sessionId} title rejected: ${String(error)}`);
+        }
+      }
+      if (startsTurn) {
+        // Recheck host-created occupants that appeared during agent setup.
+        this.assertMutableWorkspaceAvailable(workspace.path, sessionId, {});
+        agent.followup(createUserMessage({
           content: [{ type: 'text', text: initialMessage }],
           source: { kind: 'user' },
-        }),
-      );
-    }
-    return this.viewOf(agent);
+        }));
+      }
+      return await this.viewOf(agent);
+    });
   }
 
   async sendMessage(
     sessionId: string,
     message: string,
     requestId?: string,
-  ): Promise<{ session_id: string; accepted: boolean; request_id?: string; replayed?: boolean }> {
+    mode: 'queue' | 'steer' | 'interrupt' = 'queue',
+  ): Promise<MessageAccepted> {
     if (message.trim() === '') throw new BridgeError('EMPTY_MESSAGE', 'message must not be empty');
-    // Without request_id the call is deliberately NOT deduplicated: a repeated
-    // send queues a second turn. Passing request_id makes connector retries safe.
     const useKey = requestId !== undefined && requestId !== '';
-    const fingerprint = JSON.stringify({ session_id: sessionId, message });
-    // Deliberately NOT folded into replayGoalRequest below: this gate keys a
-    // different map (messageRequests, in-process only), replays a different
-    // result shape, and words its conflict differently. Same three rules,
-    // different fact — do not "unify" them.
-    if (useKey) {
-      const existing = this.messageRequests.get(requestId);
-      if (existing !== undefined) {
-        if (existing.fingerprint !== fingerprint) {
-          throw new BridgeError(
-            'REQUEST_ID_CONFLICT',
-            `request_id "${requestId}" was already used with a different message`,
-          );
+    const fingerprint = JSON.stringify({ session_id: sessionId, message, mode });
+    const { value, shared } = await this.messageFlights.run(requestId, fingerprint, async () => {
+      if (useKey) {
+        const existing = this.messageRequests.get(requestId);
+        if (existing !== undefined) {
+          if (existing.fingerprint !== fingerprint) {
+            throw new BridgeError('IDEMPOTENCY_CONFLICT',
+              `request_id "${requestId}" was already used with a different dispatch; the original receipt remains the authoritative acceptance`);
+          }
+          return { session_id: existing.sessionId, accepted: true, request_id: requestId, replayed: true };
         }
-        return { session_id: existing.sessionId, accepted: true, request_id: requestId, replayed: true };
       }
-    }
-    this.adopt(sessionId);
-    const agent = await this.ensureAgent(sessionId);
-    agent.followup(
-      createUserMessage({
-        content: [{ type: 'text', text: message }],
-        source: { kind: 'user' },
-      }),
-    );
-    if (useKey) this.messageRequests.set(requestId, { sessionId, fingerprint });
-    return { session_id: sessionId, accepted: true, ...(useKey ? { request_id: requestId } : {}) };
+      return this.inSessionWorkspace(sessionId, async (workspacePath) => {
+        // All ordinary messages are potentially mutating, even on a session
+        // whose earlier goal carried a read_only concurrency hint.
+        await this.takeWorkspaceLock(workspacePath, sessionId, {});
+        // 'on-error': a successful followup returns before the agent can be
+        // proven active — releasing there would drop the seat early.
+        return this.runReleasingLock(sessionId, 'on-error', async () => {
+          this.adopt(sessionId);
+          const agent = await this.ensureAgent(sessionId);
+          this.assertSessionWorkspace(sessionId, agent.session.header.cwd, workspacePath);
+          this.assertMutableWorkspaceAvailable(workspacePath, sessionId, {});
+          const userMessage = createUserMessage({
+            content: [{ type: 'text', text: message }],
+            source: { kind: 'user' },
+          });
+          if (mode === 'steer') {
+            // Next step boundary mid-turn; on an idle agent the host opens a turn.
+            agent.steer(userMessage);
+          } else if (mode === 'interrupt') {
+            // Abort first (the host reclassifies this waking input to next-turn
+            // and latches it until the aborted activity converges), keep queued
+            // work, then follow up so the new turn carries this message.
+            agent.cancel({ kind: 'user' }, { keepInbox: true });
+            agent.followup(userMessage);
+          } else {
+            agent.followup(userMessage);
+          }
+          if (useKey) {
+            this.messageRequests.set(requestId, { sessionId, fingerprint });
+            this.messageReceipts.set(requestId, {
+              request_id: requestId,
+              session_id: sessionId,
+              payload_hash: fingerprint,
+              mode,
+              accepted_at: new Date().toISOString(),
+            });
+            this.receiptStore.save([...this.messageReceipts.values()]);
+          }
+          return { session_id: sessionId, accepted: true, ...(useKey ? { request_id: requestId } : {}) };
+        });
+      });
+    });
+    return shared ? { ...value, replayed: true } : value;
   }
 
-  async cancelTask(sessionId: string): Promise<{ session_id: string; cancelled: boolean }> {
+  /**
+   * Query the persisted delivery receipt of a dsh_send_message request_id.
+   * States: accepted (receipt found, payload hash echoes) or REQUEST_NOT_FOUND
+   * (never accepted — or evicted from the ≤256-row retention window).
+   */
+  messageStatus(sessionId: string, requestId: string): {
+    state: 'accepted';
+    session_id: string;
+    request_id: string;
+    mode?: 'queue' | 'steer' | 'interrupt';
+    payload_hash: string;
+    accepted_at?: string;
+  } {
+    const receipt = this.messageReceipts.get(requestId);
+    const legacy = this.messageRequests.get(requestId);
+    const sessionMatches = receipt?.session_id === sessionId || legacy?.sessionId === sessionId;
+    if (!sessionMatches) {
+      throw new BridgeError('REQUEST_NOT_FOUND',
+        `request_id "${requestId}" has no accepted receipt for session ${sessionId} (never accepted, or evicted from the 256-row retention window)`);
+    }
+    return {
+      state: 'accepted',
+      session_id: sessionId,
+      request_id: requestId,
+      payload_hash: receipt?.payload_hash ?? legacy?.fingerprint ?? '',
+      ...(receipt === undefined ? {} : { mode: receipt.mode, accepted_at: receipt.accepted_at }),
+    };
+  }
+
+  async cancelTask(sessionId: string): Promise<{ session_id: string; cancelled: boolean; external_jobs_may_run: true }> {
     const agent = this.ctx.agents.get(SessionId(sessionId));
     if (agent === undefined) {
       throw new BridgeError('SESSION_NOT_LIVE', `session ${sessionId} is not loaded; only live sessions can be cancelled`);
     }
     agent.cancel({ kind: 'user' });
-    return { session_id: sessionId, cancelled: true };
+    // Cancellation stops the agent; processes it spawned are outside our reach
+    // and may still run. Resource cleanup is its own question (P1-06).
+    return { session_id: sessionId, cancelled: true, external_jobs_may_run: true };
   }
 
   // ── relay facade ──────────────────────────────────────────────────────────
@@ -583,23 +760,39 @@ export class Bridge {
     requestId: string | undefined,
     fingerprint: string,
     verb: string,
+    workspacePath: string,
   ): Promise<GoalStartResult | undefined> {
     if (requestId === undefined || requestId === '') return undefined;
     const existing = this.goalRequests.get(requestId);
     if (existing === undefined) return undefined;
     if (existing.fingerprint !== fingerprint) {
-      throw new BridgeError(
-        'REQUEST_ID_CONFLICT',
-        `request_id "${requestId}" was already used with different ${verb} arguments`,
-      );
+      throw new BridgeError('REQUEST_ID_CONFLICT',
+        `request_id "${requestId}" was already used with different ${verb} arguments`);
     }
-    this.adopt(existing.sessionId);
-    const current = nativeGet(this.goalHost(), existing.sessionId);
-    if (current === undefined) return undefined;
-    return this.mapStartNative(existing.sessionId, nativeGoalWire(existing.sessionId, current), {
-      existing_goal_reused: true,
-      revision_unchanged: true,
-    });
+    const view = await this.loadView(existing.sessionId);
+    this.assertSessionWorkspace(existing.sessionId, view.header.cwd, workspacePath);
+    // Restore the recorded session, never fall through to a new create merely
+    // because nativeGet cannot read an unloaded agent. Loading does NOT re-arm.
+    // Replay takes NO workspace lock and never takes over: its goal-id/CAS
+    // validation is read-only and must not cancel a foreign writer even when
+    // it ultimately rejects the replay.
+    try {
+      this.adopt(existing.sessionId);
+      await this.ensureAgent(existing.sessionId);
+      const current = nativeGet(this.goalHost(), existing.sessionId);
+      if (current === undefined) {
+        throw new BridgeError('GOAL_NOT_FOUND', `request_id "${requestId}" was already accepted, but its goal was cleared; use a new request_id for new work`);
+      }
+      if (existing.goalId !== undefined && existing.goalId !== current.id) {
+        throw new BridgeError('REQUEST_ID_STALE', `request_id "${requestId}" belongs to a replaced goal; use a new request_id for new work`);
+      }
+      return await this.mapStartNative(existing.sessionId, nativeGoalWire(existing.sessionId, current), {
+        existing_goal_reused: true,
+        revision_unchanged: true,
+      });
+    } finally {
+      this.releaseUnusedWorkspaceLock(existing.sessionId);
+    }
   }
 
   private statusOf(sessionId: string, view: LoadedView): BridgeStatus {
@@ -613,13 +806,13 @@ export class Bridge {
   }
 
   private async viewOf(agent: Agent): Promise<SessionView> {
-    return this.getSession(agent.id, this.cfg.sessionMaxItems, this.cfg.sessionMaxChars);
+    return this.getSession(agent.id, liveValue(this.cfg.sessionMaxItems), liveValue(this.cfg.sessionMaxChars));
   }
 
   async getSession(sessionId: string, maxItems?: number, maxChars?: number): Promise<SessionView> {
     const view = await this.loadView(sessionId);
-    const items = maxItems ?? this.cfg.sessionMaxItems;
-    const chars = maxChars ?? this.cfg.sessionMaxChars;
+    const items = maxItems ?? liveValue(this.cfg.sessionMaxItems);
+    const chars = maxChars ?? liveValue(this.cfg.sessionMaxChars);
     const pending = pendingOf(view.agent, view.events);
     const waiting = this.relays.waitingFor(sessionId, view.events);
     const status = this.statusOf(sessionId, view);
@@ -640,10 +833,26 @@ export class Bridge {
       messages: summarizeMessages(view.events, items, chars),
       ...(span === undefined ? {} : { last_turn: { turn: span.turn, ...(span.reason === undefined ? {} : { reason: span.reason.kind }) } }),
       ...this.sessionExtras(sessionId, view.events),
+      snapshot: {
+        observed_at: new Date().toISOString(),
+        ...(view.events.at(-1) === undefined ? {} : { last_event_seq: view.events.at(-1)!.seq }),
+      },
     };
   }
 
-  async listSessions(options: { limit?: number; offset?: number; workspace?: string }): Promise<SessionSummary[]> {
+  async listSessions(options: {
+    limit?: number;
+    offset?: number;
+    workspace?: string;
+    /** Case-insensitive substring match on the title (P1-02). */
+    query?: string;
+    /** Exact title equality (P1-02). */
+    title_exact?: string;
+    /** 'live' = in-process agent attached; 'persisted' = cold only (P1-02). */
+    state?: 'live' | 'persisted' | 'all';
+    /** ISO timestamp: only rows with a KNOWN updated_at at or after it (P1-02). */
+    updated_after?: string;
+  }): Promise<SessionSummary[]> {
     const persistence = this.ctx.get('sessionPersistence');
     const persisted = persistence === undefined ? [] : await persistence.list();
     const live = this.ctx.sessions.list();
@@ -658,21 +867,26 @@ export class Bridge {
       const workspace = await this.resolveWorkspace(options.workspace);
       rows = rows.filter((header) => header.cwd !== undefined && pathsEqual(header.cwd, workspace.path));
     }
+    if (options.state === 'live') rows = rows.filter((header) => this.ctx.agents.get(header.id) !== undefined);
+    if (options.state === 'persisted') rows = rows.filter((header) => this.ctx.agents.get(header.id) === undefined);
     rows.sort((a, b) => b.createdAt - a.createdAt);
+    // Title/recency filters force assembling every candidate row; without them
+    // only the page is assembled (cold rows read the cheap title cache).
+    const needsRowFilters = options.query !== undefined || options.title_exact !== undefined || options.updated_after !== undefined;
     const offset = Math.max(options.offset ?? 0, 0);
     const limit = Math.min(Math.max(options.limit ?? 50, 1), 100);
-    const page = rows.slice(offset, offset + limit);
-    const out: SessionSummary[] = [];
+    const candidates = needsRowFilters ? rows : rows.slice(offset, offset + limit);
     const cache = this.ctx.get('sessionProjectionCache');
-    for (const header of page) {
+    const assembled: SessionSummary[] = [];
+    for (const header of candidates) {
       const agent = this.ctx.agents.get(header.id);
       if (agent === undefined) {
-        out.push(sessionSummary({ header, title: cachedTitle(cache, header) }));
+        assembled.push(sessionSummary({ header, title: cachedTitle(cache, header) }));
         continue;
       }
       const events = sessionEvents(agent.session);
       const waiting = this.relays.waitingFor(header.id, events);
-      out.push(sessionSummary({
+      assembled.push(sessionSummary({
         header,
         title: titleOf({ session: agent.session, events }, this.ctx.sessionTitle),
         status: deriveRowStatus({
@@ -682,38 +896,123 @@ export class Bridge {
           pendingQuestions: waiting.questions.length,
         }),
         updatedAt: lastEventTime(events),
+        live: true,
       }));
     }
-    return out;
+    let filtered = assembled;
+    if (options.query !== undefined) {
+      const needle = options.query.toLowerCase();
+      filtered = filtered.filter((row) => row.title !== undefined && row.title.toLowerCase().includes(needle));
+    }
+    if (options.title_exact !== undefined) {
+      filtered = filtered.filter((row) => row.title === options.title_exact);
+    }
+    if (options.updated_after !== undefined) {
+      const stamp = Date.parse(options.updated_after);
+      if (Number.isNaN(stamp)) throw new BridgeError('INVALID_ARGUMENT', `updated_after must be an ISO timestamp, got ${options.updated_after}`);
+      // Rows with updated_at null are excluded — "unknown" must never sneak
+      // through as "recent" (P1-02 freshness discipline).
+      filtered = filtered.filter((row) => row.updated_at !== null && Date.parse(row.updated_at) >= stamp);
+    }
+    return needsRowFilters ? filtered.slice(offset, offset + limit) : filtered;
   }
 
-  async getResult(sessionId: string, maxChars?: number): Promise<ResultView> {
+  /**
+   * Total-payload budget (P1: a supervisor's `max_chars=800` must not be met
+   * by ~49k of sections). Applies AFTER the per-field budgets, degrading
+   * deterministically: drop result_schema, stub tool-call arguments, shrink
+   * changed_files to 5, finally re-truncate the assistant text. Sets
+   * truncated.total so callers learn an extra layer was applied.
+   */
+  private enforceTotalBudget(view: ResultView, budget: number): ResultView {
+    let current = view;
+    const over = (): boolean => JSON.stringify(current).length > budget;
+    if (!over()) return current;
+    let total = false;
+    if (current.result_schema !== undefined) {
+      const { result_schema, ...rest } = current;
+      current = rest;
+      total = true;
+    }
+    if (over() && current.tool_calls.some((call) => call.arguments !== '…')) {
+      current = { ...current, tool_calls: current.tool_calls.map((call) => ({ ...call, arguments: '…' })) };
+      total = true;
+    }
+    if (over() && current.changed_files.length > 5) {
+      current = { ...current, changed_files: current.changed_files.slice(0, 5) };
+      total = true;
+    }
+    if (over() && current.assistant_text.length > 200) {
+      const excess = JSON.stringify(current).length - budget;
+      const keep = Math.max(200, current.assistant_text.length - excess);
+      current = { ...current, assistant_text: truncate(current.assistant_text, keep) };
+      total = true;
+    }
+    // A caller may demand less than the irreducible skeleton (status, ids,
+    // markers); in that case the skeleton stays intact — never cut JSON.
+    if (!total) return current;
+    const truncated = { ...current.truncated, total: true };
+    return { ...current, truncated };
+  }
+
+  async getResult(sessionId: string, maxChars?: number, detail: 'summary' | 'standard' | 'full' = 'standard', totalMaxChars?: number): Promise<ResultView> {
+    this.adopt(sessionId);
     const view = await this.loadView(sessionId);
     const span = lastTurnSpan(view.events);
     if (span === undefined) {
       throw new BridgeError('NO_RESULT_YET', `session ${sessionId} has no turn yet; send a message first`);
     }
-    const chars = maxChars ?? this.cfg.resultMaxChars;
-    const items = this.cfg.resultMaxItems;
+    const chars = maxChars ?? liveValue(this.cfg.resultMaxChars);
+    const items = liveValue(this.cfg.resultMaxItems);
     const text = assistantTextForTurn(view.events, span.turn);
     const status = this.statusOf(sessionId, view);
     const error = span.reason !== undefined && span.reason.kind === 'error'
       ? { code: span.reason.error.code, message: span.reason.error.message }
       : undefined;
-    const resultSchema = await this.getStructuredResult(sessionId).catch(() => undefined);
-    return {
+    // Per-field budgets (P1-01): max_chars bounded only the assistant text; the
+    // tool call tail and file list got their own ceilings and omission counts.
+    const rawCalls = toolCallsForTurn(view.events, span.turn, detail === 'summary' ? 10 : items);
+    const allFiles = collectChangedFiles(view.events, span.turn);
+    const fileLimit = detail === 'summary' ? 5 : detail === 'full' ? Number.POSITIVE_INFINITY : 200;
+    const calls = detail === 'full'
+      ? rawCalls
+      : rawCalls.map((call) => {
+        if (detail === 'summary') return { ...call, arguments: '…' };
+        return { ...call, arguments: truncate(call.arguments, 500) };
+      });
+    const files = allFiles.slice(0, fileLimit);
+    const lastFailure = lastFailureBefore(view.events, span.turn);
+    // Keep the raw last-turn view and structured summary on one event snapshot.
+    let resultSchema: ResultSchema | undefined;
+    if (detail !== 'summary') {
+      try { resultSchema = this.structuredResultOf(sessionId, view); } catch { /* optional projection */ }
+    }
+    const built: ResultView = {
       session_id: sessionId,
       status,
       turn: span.turn,
       assistant_text: truncate(text, chars),
-      changed_files: collectChangedFiles(view.events, span.turn),
-      tool_calls: toolCallsForTurn(view.events, span.turn, items).map((call) => ({
-        ...call,
-        arguments: truncate(call.arguments, 500),
-      })),
+      changed_files: files,
+      tool_calls: calls,
+      detail,
+      omitted_counts: {
+        tool_calls: Math.max(0, toolCallsForTurn(view.events, span.turn, Number.POSITIVE_INFINITY).length - calls.length),
+        changed_files: allFiles.length - files.length,
+      },
+      truncated: {
+        text: text.length > chars,
+        tool_calls: rawCalls.length > calls.length || rawCalls.some((call) => call.arguments.length > 500 && detail === 'standard'),
+        changed_files: allFiles.length > files.length,
+      },
+      snapshot: {
+        observed_at: new Date().toISOString(),
+        ...(view.events.at(-1) === undefined ? {} : { last_event_seq: view.events.at(-1)!.seq }),
+      },
       ...(error === undefined ? {} : { error }),
+      ...(lastFailure === undefined ? {} : { last_failure: lastFailure }),
       ...(resultSchema === undefined ? {} : { result_schema: resultSchema }),
     };
+    return totalMaxChars === undefined ? built : this.enforceTotalBudget(built, totalMaxChars);
   }
 
   async getTaskStatus(sessionId: string): Promise<{
@@ -721,28 +1020,40 @@ export class Bridge {
     status: BridgeStatus;
     live: boolean;
     agent_status?: 'idle' | 'running';
+    /** Where current activity comes from (P0-01): 'goal' when an armed native goal drives, 'manual' otherwise; omitted when nothing runs. */
+    execution_origin?: 'goal' | 'manual';
     pending: { nextTurn: number; nextStep: number };
     waiting: WaitingState;
     last_turn?: { turn: number; reason?: string };
     updated_at?: string;
     todos?: { content: string; status: string }[];
     goal?: NativeGoalWire;
+    /** Read snapshot markers (P1-03): pair this call's fields by revision. */
+    snapshot: { observed_at: string; last_event_seq?: number };
   }> {
     const view = await this.loadView(sessionId);
     const status = this.statusOf(sessionId, view);
     this.releaseWorkspaceIfTerminal(sessionId, status);
     const pending = pendingOf(view.agent, view.events);
     const span = lastTurnSpan(view.events);
+    const extras = this.sessionExtras(sessionId, view.events);
     return {
       session_id: sessionId,
       status,
       live: view.agent !== undefined,
       ...(view.agent === undefined ? {} : { agent_status: view.agent.status }),
+      ...(view.agent?.status !== 'running'
+        ? {}
+        : { execution_origin: extras.goal !== undefined && extras.goal.activation === 'armed' ? ('goal' as const) : ('manual' as const) }),
       pending,
       waiting: this.relays.waitingFor(sessionId, view.events),
       ...(span === undefined ? {} : { last_turn: { turn: span.turn, ...(span.reason === undefined ? {} : { reason: span.reason.kind }) } }),
       updated_at: lastEventTime(view.events),
-      ...this.sessionExtras(sessionId, view.events),
+      snapshot: {
+        observed_at: new Date().toISOString(),
+        ...(view.events.at(-1) === undefined ? {} : { last_event_seq: view.events.at(-1)!.seq }),
+      },
+      ...extras,
     };
   }
 
@@ -762,10 +1073,6 @@ export class Bridge {
     goal?: NativeGoalWire;
   } {
     const facts = foldSessionFacts(events);
-    // Read paths keep the observed-mutation ledger warm (evidence ids are
-    // derived per read, not stored) — recording is a pure idempotent
-    // observation, even with no native goal present.
-    this.recordObservedExecutions(sessionId, undefined, facts);
     const native = nativeGet(this.goalHost(), sessionId);
     return {
       ...(facts.todos === undefined ? {} : { todos: facts.todos }),
@@ -815,36 +1122,50 @@ export class Bridge {
     checkpoint_revision: number;
     goal?: NativeGoalWire;
   }> {
-    const { native, status } = await this.doPause(sessionId);
-    return {
-      session_id: sessionId,
-      status,
-      paused: true,
-      checkpoint_revision: native.revision,
-      goal: nativeGoalWire(sessionId, native),
-    };
+    return this.inSessionWorkspace(sessionId, async (workspacePath) => {
+      await this.claimWorkspaceIfCold(workspacePath, sessionId, { readOnly: this.isReadOnlySession(sessionId) });
+      return this.runReleasingLock(sessionId, 'always', async () => {
+        const { native, status } = await this.doPause(sessionId);
+        return {
+          session_id: sessionId,
+          status,
+          paused: true,
+          checkpoint_revision: native.revision,
+          goal: nativeGoalWire(sessionId, native),
+        };
+      });
+    });
   }
 
   /**
-   * The ONE pause ordering (adversarial audit A#2): a pause always quiesces
-   * the in-flight turn before flipping the native phase, and works on cold
-   * sessions by resuming the agent. Two frozen tools shape their responses
-   * around this; neither may re-order it.
+   * Accept the native CAS/transition synchronously BEFORE cancelling anything.
+   * Disarming first also prevents a round from starting during cancellation.
+   * A successful pause returns only after the host driver is quiescent.
    */
   private async doPause(
     sessionId: string,
     expectedRevision?: number,
   ): Promise<{ native: ReturnType<typeof nativePause>; status: BridgeStatus }> {
     this.adopt(sessionId);
-    await this.ensureAgent(sessionId);
-    const agent = this.ctx.agents.get(SessionId(sessionId));
-    if (agent !== undefined && agent.status === 'running') {
-      agent.cancel({ kind: 'user' });
+    const agent = await this.ensureAgent(sessionId);
+    const current = nativeGet(this.goalHost(), sessionId);
+    let native;
+    if (current?.phase === 'paused') {
+      if (expectedRevision !== undefined && expectedRevision !== current.revision) {
+        throw new BridgeError('REVISION_CONFLICT', `expected_revision mismatch: expected ${expectedRevision}, but current revision is ${current.revision}`);
+      }
+      native = current;
+    } else {
+      native = nativePause(this.goalHost(), sessionId, expectedRevision);
     }
-    const native = nativePause(this.goalHost(), sessionId, expectedRevision);
+    this.relays.failClosed(sessionId);
+    agent.cancel({ kind: 'user' });
+    // whenIdle is guaranteed by the pinned host; optional only for minimal
+    // synthetic Agent fixtures used by the unit suite.
+    await agent.whenIdle?.();
+    this.releaseUnusedWorkspaceLock(sessionId);
     const view = await this.loadView(sessionId);
-    const status = await this.statusOf(sessionId, view);
-    return { native, status };
+    return { native, status: this.statusOf(sessionId, view) };
   }
 
   async resumeGoal(
@@ -866,22 +1187,25 @@ export class Bridge {
 
   async getStructuredResult(sessionId: string): Promise<ResultSchema> {
     this.adopt(sessionId);
-    const view = await this.loadView(sessionId);
-    const status = await this.statusOf(sessionId, view);
-    const workspace = view.header?.cwd ?? '';
+    return this.structuredResultOf(sessionId, await this.loadView(sessionId));
+  }
+
+  private structuredResultOf(sessionId: string, view: LoadedView): ResultSchema {
     const native = nativeGet(this.goalHost(), sessionId);
-    const lastMutation = workspace === '' ? undefined : this.workspaceGuard.getLastMutation(workspace);
+    const goal = native === undefined ? undefined : nativeGoalWire(sessionId, native);
+    const events = selectResultEvents(view.events, goal);
     return buildResultSchema({
       sessionId,
-      ...(native === undefined ? {} : { goal: nativeGoalWire(sessionId, native) }),
-      events: view.events,
-      status,
-      workspace,
-      evidenceIds: derivedEvidenceIds(sessionId, view.events),
+      ...(goal === undefined ? {} : { goal }),
+      events,
+      status: this.statusOf(sessionId, view),
+      workspace: view.header.cwd ?? '',
+      evidenceIds: derivedEvidenceIds(sessionId, events),
       credentialRefs: this.getCredentialStatus()
         .filter((item) => item.credentialAvailable)
         .map((item) => item.credentialRef),
-      originatingStep: lastMutation?.stepId ?? lastMutation?.type,
+      // Provenance is derived from these scoped facts, never another session's
+      // workspace mutation or a previous generation's successful operation.
       warnings: [],
     });
   }
@@ -894,41 +1218,51 @@ export class Bridge {
     });
   }
 
-  async startGoal(input: {
-    workspace: string;
-    goal: string;
-    plan?: string;
-    session_id?: string;
-    request_id?: string;
-    max_goal_rounds?: number;
-    expected_revision?: number;
-    workspace_lock_override?: boolean;
-    read_only?: boolean;
-  }): Promise<GoalStartResult> {
-    // plan is advertised as "embedded into the objective" (mcp start_goal
-    // schema) — actually embed it; it silently vanished before (audit A#4).
+  async startGoal(input: StartGoalInput): Promise<GoalStartResult> {
     const plan = input.plan?.trim() ?? '';
     const objective = plan === '' ? input.goal.trim() : `${input.goal.trim()}\n\nPlan:\n${plan}`;
     if (objective === '') throw new BridgeError('EMPTY_GOAL', 'goal must not be empty');
-    const host = this.goalHost();
-
     const fingerprint = fingerprintRequest({
       workspace: input.workspace,
       goal: objective,
       session_id: input.session_id ?? '',
       max_goal_rounds: input.max_goal_rounds ?? 0,
       expected_revision: input.expected_revision ?? 0,
+      ...(input.workspace_lock_override === true ? { workspace_lock_override: true } : {}),
+      ...(input.read_only === true ? { read_only: true } : {}),
     });
-    const replayed = await this.replayGoalRequest(input.request_id, fingerprint, 'start_goal');
-    if (replayed !== undefined) return replayed;
+    const { value, shared } = await this.goalFlights.run(input.request_id, fingerprint, async () => {
+      const workspace = await this.resolveWorkspace(input.workspace);
+      return this.workspaceOperations.run(workspace.path, async () => {
+        const replayed = await this.replayGoalRequest(input.request_id, fingerprint, 'start_goal', workspace.path);
+        if (replayed !== undefined) return replayed;
+        return this.startGoalInWorkspace(input, objective, fingerprint, workspace);
+      });
+    });
+    return shared ? { ...value, existing_goal_reused: true, revision_unchanged: true } : value;
+  }
 
+  private async startGoalInWorkspace(
+    input: StartGoalInput,
+    objective: string,
+    fingerprint: string,
+    resolvedWorkspace: Workspace,
+  ): Promise<GoalStartResult> {
+    const host = this.goalHost();
+    if (host.goals === undefined) throw new BridgeError('GOAL_UNAVAILABLE', 'host goal service (goals) is not injected in this profile');
+    if (input.max_goal_rounds !== undefined && (!Number.isSafeInteger(input.max_goal_rounds) || input.max_goal_rounds < 1)) {
+      throw new BridgeError('GOAL_INVALID', 'max_goal_rounds must be a positive safe integer');
+    }
     let sessionId = input.session_id;
-    const resolvedWorkspace = await this.resolveWorkspace(input.workspace);
+    let createdHere = false;
     const workspacePath = resolvedWorkspace.path;
     const lockOverride = input.workspace_lock_override === true;
     // Bridge-level concurrency classification only: a read-only audit coexists
-    // with a mutable lock; native goal semantics do not know this flag.
-    const isReadOnly = input.read_only === true;
+    // with a mutable lock; native goal semantics do not know this flag. The
+    // hint may classify only a session this dispatch creates — it can NEVER
+    // downgrade an existing session whose classification is unknown (default:
+    // mutable; adversarial review: a bridge reload wiped all local locks).
+    const requestedReadOnly = input.read_only === true;
 
     if (sessionId === undefined || sessionId === '') {
       // Native-equivalent targeting on this workspace: an identical active
@@ -944,7 +1278,9 @@ export class Bridge {
           sessionId = agent.id;
           break;
         }
-        if (existingGoal.phase === 'complete' && replaceCandidate === undefined) {
+        // A fresh audit hint may classify only a newly created session. Do not
+        // implicitly downgrade a completed mutable (or unknown) session.
+        if (!requestedReadOnly && existingGoal.phase === 'complete' && replaceCandidate === undefined) {
           replaceCandidate = agent.id;
         }
       }
@@ -952,47 +1288,58 @@ export class Bridge {
         sessionId = replaceCandidate;
       }
       if (sessionId === undefined || sessionId === '') {
-        this.assertMutableWorkspaceAvailable(workspacePath, undefined, lockOverride, isReadOnly);
-        const created = await this.createSession(input.workspace, titleFromGoal(objective));
+        this.assertMutableWorkspaceAvailable(workspacePath, undefined, { override: lockOverride, readOnly: requestedReadOnly });
+        const created = await this.createSessionInWorkspace(resolvedWorkspace, titleFromGoal(objective));
         sessionId = created.session_id;
+        createdHere = true;
       }
     }
-    this.adopt(sessionId);
-
-    const current = nativeGet(host, sessionId);
-    if (current !== undefined && current.phase !== 'complete') {
-      if (current.objective === objective) {
-        if (input.request_id !== undefined && input.request_id !== '') {
-          this.rememberRequestId(input.request_id, { sessionId, fingerprint });
+    const view = await this.loadView(sessionId);
+    // Validate the actual session binding before loading, adopting or mutating it.
+    this.assertSessionWorkspace(sessionId, view.header.cwd, workspacePath);
+    return this.runReleasingLock(sessionId, 'on-error', async () => {
+      this.adopt(sessionId);
+      // Load the session BEFORE any lock acquisition or takeover: validating
+      // expected_revision and identical-objective reuse is read-only, and a
+      // stale expected_revision must never cancel a foreign writer. (The
+      // per-workspace operation queue already serializes competing starts, so
+      // the lock's pre-load reservation is unnecessary.)
+      await this.ensureAgent(sessionId);
+      const current = nativeGet(host, sessionId);
+      if (input.expected_revision !== undefined && current !== undefined && input.expected_revision !== current.revision) {
+        throw new BridgeError('REVISION_CONFLICT',
+          `expected_revision mismatch: expected ${input.expected_revision}, but current revision is ${current.revision}`);
+      }
+      if (current !== undefined && current.phase !== 'complete') {
+        if (current.objective === objective
+          && (input.max_goal_rounds === undefined || input.max_goal_rounds === current.maxGoalRounds)) {
+          if (this.isLockHolderActive(sessionId)) await this.takeWorkspaceLock(workspacePath, sessionId, { override: lockOverride, readOnly: this.isReadOnlySession(sessionId) });
+          if (input.request_id !== undefined && input.request_id !== '') {
+            this.rememberRequestId(input.request_id, { sessionId, fingerprint, goalId: current.id });
+          }
+          return await this.mapStartNative(sessionId, nativeGoalWire(sessionId, current), {
+            existing_goal_reused: true,
+            revision_unchanged: true,
+          });
         }
-        return this.mapStartNative(sessionId, nativeGoalWire(sessionId, current), {
-          existing_goal_reused: true,
-          revision_unchanged: true,
-        });
+        throw new BridgeError('GOAL_ALREADY_EXISTS',
+          `session ${sessionId} already has a ${current.phase} native goal (revision ${current.revision}); use dsh_revise_goal or dsh_update_goal`,
+          { goal_id: current.id, revision: current.revision });
       }
-      throw new BridgeError(
-        'GOAL_ALREADY_EXISTS',
-        `session ${sessionId} already has a ${current.phase} native goal (revision ${current.revision}); use dsh_revise_goal or dsh_update_goal`,
-        { goal_id: current.id, revision: current.revision },
-      );
-    }
-    if (input.expected_revision !== undefined && current !== undefined && input.expected_revision !== current.revision) {
-      throw new BridgeError(
-        'REVISION_CONFLICT',
-        `expected_revision mismatch: expected ${input.expected_revision}, but current revision is ${current.revision}`,
-      );
-    }
-
-    await this.takeWorkspaceLock(workspacePath, sessionId, lockOverride, isReadOnly);
-
-    const native = nativeCreate(host, sessionId, {
-      objective,
-      ...(input.max_goal_rounds === undefined ? {} : { max_goal_rounds: input.max_goal_rounds }),
+      // Fresh work never inherits the previous goal's concurrency exemption,
+      // even if the host completed/replaced that goal without a terminal read.
+      const freshReadOnly = createdHere && requestedReadOnly;
+      await this.takeWorkspaceLock(workspacePath, sessionId, { override: lockOverride, readOnly: freshReadOnly });
+      const native = nativeCreate(host, sessionId, {
+        objective,
+        ...(input.max_goal_rounds === undefined ? {} : { max_goal_rounds: input.max_goal_rounds }),
+      });
+      if (freshReadOnly) this.readOnlySessions.set(sessionId, native.id);
+      if (input.request_id !== undefined && input.request_id !== '') {
+        this.rememberRequestId(input.request_id, { sessionId, fingerprint, goalId: native.id });
+      }
+      return await this.mapStartNative(sessionId, nativeGoalWire(sessionId, native));
     });
-    if (input.request_id !== undefined && input.request_id !== '') {
-      this.rememberRequestId(input.request_id, { sessionId, fingerprint });
-    }
-    return this.mapStartNative(sessionId, nativeGoalWire(sessionId, native));
   }
 
   async updateGoal(
@@ -1015,28 +1362,36 @@ export class Bridge {
       expected_revision: input.expected_revision ?? 0,
       max_goal_rounds: input.max_goal_rounds ?? 0,
     });
-    const replayed = await this.replayGoalRequest(input.request_id, fingerprint, 'update_goal');
-    if (replayed !== undefined) return replayed;
-    this.adopt(sessionId);
-    await this.ensureAgent(sessionId);
-
-    let native;
-    if (action === 'resume') {
-      native = nativeResume(this.goalHost(), sessionId, input.expected_revision);
-    } else if (action === 'pause') {
-      // Same single pause ordering as dsh_pause_goal (audit A#2).
-      ({ native } = await this.doPause(sessionId, input.expected_revision));
-    } else {
-      native = nativeEdit(this.goalHost(), sessionId, {
-        ...(input.goal === undefined ? {} : { objective: input.goal }),
-        ...(input.max_goal_rounds === undefined ? {} : { max_goal_rounds: input.max_goal_rounds }),
-        ...(input.expected_revision === undefined ? {} : { expected_revision: input.expected_revision }),
-      });
-    }
-    if (input.request_id !== undefined && input.request_id !== '') {
-      this.rememberRequestId(input.request_id, { sessionId, fingerprint });
-    }
-    return this.mapStartNative(sessionId, nativeGoalWire(sessionId, native));
+    const { value, shared } = await this.goalFlights.run(input.request_id, fingerprint, () =>
+      this.inSessionWorkspace(sessionId, async (workspacePath) => {
+        const replayed = await this.replayGoalRequest(input.request_id, fingerprint, 'update_goal', workspacePath);
+        if (replayed !== undefined) return replayed;
+        const policy: LockPolicy = { readOnly: this.isReadOnlySession(sessionId) };
+        await this.claimWorkspaceIfCold(workspacePath, sessionId, policy);
+        return this.runReleasingLock(sessionId, 'always', async () => {
+          this.adopt(sessionId);
+          await this.ensureAgent(sessionId);
+          let native;
+          if (action === 'resume') {
+            await this.takeWorkspaceLock(workspacePath, sessionId, policy);
+            native = nativeResume(this.goalHost(), sessionId, input.expected_revision);
+          } else if (action === 'pause') {
+            ({ native } = await this.doPause(sessionId, input.expected_revision));
+          } else {
+            if (this.isLockHolderActive(sessionId)) await this.takeWorkspaceLock(workspacePath, sessionId, policy);
+            native = nativeEdit(this.goalHost(), sessionId, {
+              ...(input.goal === undefined ? {} : { objective: input.goal }),
+              ...(input.max_goal_rounds === undefined ? {} : { max_goal_rounds: input.max_goal_rounds }),
+              ...(input.expected_revision === undefined ? {} : { expected_revision: input.expected_revision }),
+            });
+          }
+          if (input.request_id !== undefined && input.request_id !== '') {
+            this.rememberRequestId(input.request_id, { sessionId, fingerprint, goalId: native.id });
+          }
+          return await this.mapStartNative(sessionId, nativeGoalWire(sessionId, native));
+        });
+      }));
+    return shared ? { ...value, existing_goal_reused: true, revision_unchanged: true } : value;
   }
 
   async waitGoal(sessionId: string, waitSeconds?: number, sinceSeq?: number): Promise<GoalWaitResult> {
@@ -1050,49 +1405,60 @@ export class Bridge {
     status: BridgeStatus;
     cleanup_warning?: string;
   }> {
-    this.adopt(sessionId);
-    this.workspaceGuard.releaseLock(sessionId);
-    const view = await this.loadView(sessionId);
-    const status = await this.statusOf(sessionId, view);
-    const current = nativeGet(this.goalHost(), sessionId);
-    if (current === undefined || current.phase === 'complete') {
-      const warning = this.cleanupSessionTemps(sessionId, view);
+    return this.inSessionWorkspace(sessionId, async (workspacePath) => {
+      this.adopt(sessionId);
+      let agent = this.ctx.agents.get(SessionId(sessionId));
+      if (agent === undefined && this.goalHost().goals !== undefined) {
+        await this.claimWorkspaceIfCold(workspacePath, sessionId, { readOnly: this.isReadOnlySession(sessionId) });
+        agent = await this.runReleasingLock(sessionId, 'on-error', () => this.ensureAgent(sessionId));
+      }
+      const view = await this.loadView(sessionId);
+      const status = this.statusOf(sessionId, view);
+      const current = nativeGet(this.goalHost(), sessionId);
+      const waiting = this.relays.waitingFor(sessionId, view.events);
+      const alreadyStopped = (current === undefined || current.phase === 'complete')
+        && !this.isLockHolderActive(sessionId) && waiting.approvals.length === 0 && waiting.questions.length === 0;
+      // Commit disarm/clear before yielding to cancellation. Never release the
+      // workspace while the cancelled driver may still write to it.
+      if (current !== undefined && current.phase !== 'complete') nativeClear(this.goalHost(), sessionId);
+      this.relays.failClosed(sessionId);
+      // Cancel + await quiescence for EVERY live agent, even when the goal is
+      // already cleared. Public 'idle' status still hides whenIdle-tracked
+      // maintenance work (the pinned Agent contract runs maintenance with
+      // status idle), and stopping must make that settle before returning.
+      // Cancel is a no-op on a truly idle agent.
+      if (agent !== undefined) {
+        agent.cancel({ kind: 'user' });
+        await agent.whenIdle?.();
+      }
+      this.releaseUnusedWorkspaceLock(sessionId);
+      this.readOnlySessions.delete(sessionId);
+      // Logs and filename patterns cannot prove ownership. Stopping a session
+      // never deletes its files, worktrees or persistent artifacts.
       return {
         session_id: sessionId,
-        stopped: true,
-        already_stopped: true,
-        status,
-        ...(warning === undefined ? {} : { cleanup_warning: warning }),
+        stopped: true as const,
+        already_stopped: alreadyStopped,
+        status: alreadyStopped ? status : 'cancelled' as const,
       };
-    }
-    this.relays.failClosed(sessionId);
-    const agent = this.ctx.agents.get(SessionId(sessionId));
-    if (agent !== undefined && agent.status === 'running') agent.cancel({ kind: 'user' });
-    nativeClear(this.goalHost(), sessionId);
-    const warning = this.cleanupSessionTemps(sessionId, view);
-    return {
-      session_id: sessionId,
-      stopped: true,
-      already_stopped: false,
-      status: 'cancelled',
-      ...(warning === undefined ? {} : { cleanup_warning: warning }),
-    };
+    });
   }
 
-  private cleanupSessionTemps(sessionId: string, view: LoadedView): string | undefined {
-    const workspace = view.header.cwd;
-    if (typeof workspace !== 'string' || workspace === '') return undefined;
-    const facts = foldSessionFacts(view.events);
-    const resources = discoverTempResources({
-      facts,
-      sessionId,
-      goalId: sessionId,
-      workspacePath: workspace,
-    });
-    if (resources.length === 0) return undefined;
-    const cleaned = cleanupTempResources(resources, workspace);
-    if (cleaned.warnings.length === 0) return undefined;
-    return cleaned.warnings.join('; ');
+  /**
+   * A classification lives only while its goal does: completion, clear, cold
+   * reload and external replacement (goal id changed) invalidate it. Pausing
+   * retains the same generation's classification.
+   */
+  private pruneReadOnlyClassification(sessionId: string): void {
+    const goalId = this.readOnlySessions.get(sessionId);
+    if (goalId === undefined) return;
+    const current = nativeGet(this.goalHost(), sessionId);
+    if (current?.id !== goalId || current.phase === 'complete') this.readOnlySessions.delete(sessionId);
+  }
+
+  private isReadOnlySession(sessionId: string): boolean {
+    this.pruneReadOnlyClassification(sessionId);
+    return this.readOnlySessions.has(sessionId);
   }
 
   private isLockHolderActive(sessionId: string): boolean {
@@ -1121,84 +1487,110 @@ export class Bridge {
   private assertMutableWorkspaceAvailable(
     workspacePath: string,
     sessionId: string | undefined,
-    override: boolean,
-    isReadOnly: boolean,
+    policy: LockPolicy,
   ): void {
-    if (isReadOnly || override) return;
+    if (policy.readOnly === true || policy.override === true) return;
+    const holder = this.activeWorkspaceHolders(workspacePath, sessionId)[0];
+    if (holder !== undefined) throw this.workspaceLockedError(holder);
+  }
+
+  /** Includes live host sessions, so a bridge reload cannot forget occupants. */
+  private activeWorkspaceHolders(
+    workspacePath: string,
+    exceptSessionId?: string,
+  ): { sessionId: string; goalId: string }[] {
+    const holders = new Map<string, { sessionId: string; goalId: string }>();
     const existing = this.workspaceGuard.getLock(workspacePath);
-    if (existing === undefined) return;
-    if (sessionId !== undefined && existing.sessionId === sessionId) return;
-    if (this.isLockHolderActive(existing.sessionId)) {
-      throw this.workspaceLockedError(existing);
+    if (existing !== undefined && existing.sessionId !== exceptSessionId && this.isLockHolderActive(existing.sessionId)) {
+      holders.set(existing.sessionId, existing);
     }
+    for (const agent of this.ctx.agents.list()) {
+      if (agent.id === exceptSessionId || this.isReadOnlySession(agent.id)) continue;
+      if (!pathsEqual(agent.session.header.cwd ?? '', workspacePath) || !this.isLockHolderActive(agent.id)) continue;
+      holders.set(agent.id, { sessionId: agent.id, goalId: nativeGet(this.goalHost(), agent.id)?.id ?? `session-${agent.id}` });
+    }
+    return [...holders.values()];
   }
 
   private async takeWorkspaceLock(
     workspacePath: string,
     sessionId: string,
-    override: boolean,
-    isReadOnly: boolean,
+    policy: LockPolicy,
   ): Promise<void> {
-    if (isReadOnly) return;
-    const existing = this.workspaceGuard.getLock(workspacePath);
-    const holderActive = existing !== undefined && existing.sessionId !== sessionId
-      ? this.isLockHolderActive(existing.sessionId)
-      : false;
-    const lockRes = this.workspaceGuard.acquireMutableLock(
-      workspacePath,
-      sessionId,
-      `goal-${sessionId}`,
-      holderActive,
-      override,
-    );
-    if (!lockRes.success && lockRes.holder !== undefined) {
-      throw this.workspaceLockedError(lockRes.holder);
+    const override = policy.override === true;
+    // Read-only sessions never hold a lock. Classification registration is
+    // explicit at the creation site (startGoal) — a missing local lock is NOT
+    // evidence a session is read-only (a bridge reload wiped local locks).
+    if (policy.readOnly === true) return;
+    const holders = this.activeWorkspaceHolders(workspacePath, sessionId);
+    if (holders.length > 0 && !override) throw this.workspaceLockedError(holders[0]);
+    for (const holder of holders) {
+      const agent = this.ctx.agents.get(SessionId(holder.sessionId));
+      if (agent === undefined) continue;
+      const goal = nativeGet(this.goalHost(), holder.sessionId);
+      if (goal?.phase === 'active') nativePause(this.goalHost(), holder.sessionId);
+      this.relays.failClosed(holder.sessionId);
+      agent.cancel({ kind: 'user' });
+      await agent.whenIdle?.();
+      this.workspaceGuard.releaseLock(holder.sessionId);
+      this.log.warn(`workspace takeover quiesced session ${holder.sessionId}`);
     }
-    if (lockRes.warning) this.log.warn(lockRes.warning);
+    const lockRes = this.workspaceGuard.acquireMutableLock(workspacePath, sessionId, `goal-${sessionId}`, false, override);
+    if (!lockRes.success && lockRes.holder !== undefined) throw this.workspaceLockedError(lockRes.holder);
+    this.readOnlySessions.delete(sessionId);
+  }
+
+  /** Explicit dispatch cleanup: an armed goal is active even between turns. */
+  private releaseUnusedWorkspaceLock(sessionId: string): void {
+    if (!this.isLockHolderActive(sessionId)) this.workspaceGuard.releaseLock(sessionId);
+  }
+
+  /** Cold sessions must claim the workspace before any load validates them. */
+  private async claimWorkspaceIfCold(
+    workspacePath: string,
+    sessionId: string,
+    policy: LockPolicy,
+  ): Promise<void> {
+    if (this.ctx.agents.get(SessionId(sessionId)) === undefined) {
+      await this.takeWorkspaceLock(workspacePath, sessionId, policy);
+    }
+  }
+
+  /**
+   * ONE lock-release skeleton for every dispatch. 'always' releases on success
+   * too (the run already advanced the agent, or abandoned its claim);
+   * 'on-error' keeps a successful reservation. The release is idempotent, so a
+   * failed run under 'always' simply releases twice with no effect.
+   */
+  private async runReleasingLock<T>(
+    sessionId: string,
+    mode: 'always' | 'on-error',
+    run: () => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await run();
+    } catch (error) {
+      this.releaseUnusedWorkspaceLock(sessionId);
+      throw error;
+    } finally {
+      if (mode === 'always') this.releaseUnusedWorkspaceLock(sessionId);
+    }
   }
 
   private releaseWorkspaceIfTerminal(sessionId: string, status: BridgeStatus): void {
-    if (isTerminalStatus(status)) this.workspaceGuard.releaseLock(sessionId);
-  }
-
-  private recordObservedExecutions(
-    sessionId: string,
-    view: LoadedView | undefined,
-    facts: ReturnType<typeof foldSessionFacts>,
-  ): void {
-    const workspacePath = view?.header?.cwd;
-    if (workspacePath === undefined || workspacePath === '') return;
-    this.recordObservedExecutionFacts(sessionId, workspacePath, facts);
-  }
-
-  private recordObservedExecutionFacts(
-    sessionId: string,
-    workspacePath: string,
-    facts: ReturnType<typeof foldSessionFacts>,
-  ): void {
-    // Mutations record exactly once — at observed success, keyed
-    // sessionId:callId (audit B#4: the approve-time write with a different
-    // key shape died here; a successful call lands ONE ledger row).
-    for (const tool of facts.tools) {
-      if (!tool.ok) continue;
-      const key = `${sessionId}:${tool.callId}`;
-      if (!isMutatingTool(tool.name, tool.command) || this.recordedMutationCalls.has(key)) continue;
-      this.rememberMutationCall(key);
-      this.workspaceGuard.recordMutation(workspacePath, {
-        stepId: tool.callId,
-        type: idempotencyKindFor(tool.name, tool.command) ?? tool.name,
-      });
+    if (this.isLockHolderActive(sessionId)) return;
+    const lock = this.workspaceGuard.getSessionLock(sessionId);
+    // A read cannot revoke a reservation while a dispatch is loading/creating.
+    if (lock !== undefined && this.workspaceOperations.isBusy(lock.workspacePath)) return;
+    if (isTerminalStatus(status) || status === 'idle' || status === 'unknown') {
+      this.workspaceGuard.releaseLock(sessionId);
+      this.pruneReadOnlyClassification(sessionId);
     }
   }
 
-  private rememberMutationCall(key: string): void {
-    this.recordedMutationCalls.add(key);
-    while (this.recordedMutationCalls.size > 2048) {
-      const oldest = this.recordedMutationCalls.values().next().value;
-      if (oldest === undefined) break;
-      this.recordedMutationCalls.delete(oldest);
-    }
-  }
+  // The observed-mutation ledger was retired with execution-idempotency.ts:
+  // evidence ids (derivedEvidenceIds below) are a pure function of facts, and
+  // provenance comes from scoped facts — never a stored ledger.
 
 }
 
@@ -1215,16 +1607,4 @@ function derivedEvidenceIds(sessionId: string, events: readonly SessionEvent[]):
     ids.add(`exec-${sessionId}:${tool.callId}`);
   }
   return [...ids];
-}
-
-/**
- * Best-effort "could this call mutate the workspace?" — advisory only; it
- * feeds the observed-mutation ledger (originating_step provenance). It never
- * decides the approval outcome (relay-only design).
- */
-function isMutatingTool(toolName: string, command?: string): boolean {
-  if (/^(?:write|edit|multiedit|apply_patch|notebook_edit)/i.test(toolName)) return true;
-  if (command === undefined) return false;
-  return /\b(?:git\s+(?:add|commit|push|merge|rebase|reset|clean)|npm\s+(?:publish|unpublish)|gh\s+release|rm|mv|cp|mkdir|touch|chmod|chown)\b/i.test(command)
-    || /(^|\s)>{1,2}\s*\S/.test(command);
 }

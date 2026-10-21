@@ -29,9 +29,13 @@ export interface SessionSummary {
   session_id: string;
   title?: string;
   workspace?: string;
-  status?: BridgeStatus;
+  /** Explicitly 'unknown' when nothing can derive it — never silently absent (E02). */
+  status: BridgeStatus | 'unknown';
   created_at: string;
-  updated_at?: string;
+  /** Explicitly null when no timestamp source exists (E02). */
+  updated_at: string | null;
+  /** True when an in-process agent is attached to this session. */
+  live: boolean;
 }
 
 /** The `inbox` slice of a live agent the read plane counts. */
@@ -119,7 +123,7 @@ export function titleOf(
 
 /**
  * Zero-I/O title for a cold session. The host's title projection is a plain
- * `string | null` (0.2.0-rc.2 `titleProjectionDefinition`), and a cache that is
+ * `string | null` (0.2.1-rc.2 `titleProjectionDefinition`), and a cache that is
  * absent, lagging, or throwing means "no hint" — never a failed list.
  */
 export function cachedTitle(cache: TitleCache | undefined, header: SessionHeader): string | undefined {
@@ -132,19 +136,25 @@ export function cachedTitle(cache: TitleCache | undefined, header: SessionHeader
   }
 }
 
-/** Assemble one list row; absent fields are omitted rather than sent null. */
+/**
+ * Assemble one list row. Fields are ALWAYS present: unknown beats absent — a
+ * missing status must never be misread as "idle" or "succeeded" by drivers
+ * that test for key presence (E02).
+ */
 export function sessionSummary(input: {
   header: SessionHeader;
   title?: string | undefined;
   status?: BridgeStatus | undefined;
   updatedAt?: string | undefined;
+  live?: boolean;
 }): SessionSummary {
   return {
     session_id: input.header.id,
     ...(input.title === undefined ? {} : { title: input.title }),
     ...(input.header.cwd === undefined ? {} : { workspace: input.header.cwd }),
-    ...(input.status === undefined ? {} : { status: input.status }),
+    status: input.status ?? 'unknown',
     created_at: iso(input.header.createdAt),
-    ...(input.updatedAt === undefined ? {} : { updated_at: input.updatedAt }),
+    updated_at: input.updatedAt ?? null,
+    live: input.live === true,
   };
 }

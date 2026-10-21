@@ -1,10 +1,9 @@
 /**
- * Cross-call request_id dedup for idempotent connector retries. Bounded,
- * process-restorable through a JSON file when cfg.dshHome is set; loss of
- * the file degrades the bridge to in-process dedup (native goal operations
- * are themselves idempotent by revision CAS, so this layer is a comfort,
- * not a correctness mechanism).
+ * Completed request records plus process-local in-flight coalescing. A key is
+ * reserved before any async work starts, so overlapping retries cannot enqueue
+ * the operation twice. Completed goal records are restored by the facade.
  */
+import { BridgeError } from './errors.js';
 
 const REQUEST_ID_CAP = 256;
 
@@ -12,6 +11,38 @@ const REQUEST_ID_CAP = 256;
 export interface RequestRecord {
   sessionId: string;
   fingerprint: string;
+  /** Identifies the accepted goal generation; old sidecar rows may omit it. */
+  goalId?: string;
+}
+
+/** In-flight keys are never evicted while their operation is pending. */
+export class RequestFlights<T> {
+  private readonly pending = new Map<string, { fingerprint: string; promise: Promise<T> }>();
+
+  run(
+    requestId: string | undefined,
+    fingerprint: string,
+    operation: () => Promise<T>,
+  ): Promise<{ value: T; shared: boolean }> {
+    if (requestId === undefined || requestId === '') {
+      return operation().then((value) => ({ value, shared: false }));
+    }
+    const existing = this.pending.get(requestId);
+    if (existing !== undefined) {
+      if (existing.fingerprint !== fingerprint) {
+        return Promise.reject(new BridgeError('REQUEST_ID_CONFLICT',
+          `request_id "${requestId}" is already in flight with different arguments`));
+      }
+      return existing.promise.then((value) => ({ value, shared: true }));
+    }
+    // Deferring invocation reserves the key synchronously, even when the
+    // operation itself immediately reaches an await or throws.
+    const promise = Promise.resolve().then(operation).finally(() => {
+      if (this.pending.get(requestId)?.promise === promise) this.pending.delete(requestId);
+    });
+    this.pending.set(requestId, { fingerprint, promise });
+    return promise.then((value) => ({ value, shared: false }));
+  }
 }
 
 /** Bounded FIFO map of request_id → resolution. */

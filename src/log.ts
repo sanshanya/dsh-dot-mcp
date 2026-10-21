@@ -1,5 +1,6 @@
 import { mkdirSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { liveValue, type VolatileConfig } from './config.js';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
@@ -20,12 +21,14 @@ export interface BridgeLogger {
 }
 
 export function createBridgeLogger(options: {
-  level: LogLevel;
+  level: VolatileConfig<LogLevel>;
   dshHome: string;
   stdioSafe: boolean;
   cordis?: { info(m: string): void; warn(m: string): void; error(m: string): void; debug?(m: string): void };
 }): BridgeLogger {
-  const threshold = LEVEL_ORDER[options.level] ?? LEVEL_ORDER.info;
+  // Read live at every line: logLevel is a volatile config field, live-editable
+  // from the DSH settings UI without restarting the bridge fiber.
+  const thresholdOf = (): number => LEVEL_ORDER[liveValue(options.level)] ?? LEVEL_ORDER.info;
   let file: string | undefined;
   try {
     const dir = options.dshHome || process.cwd();
@@ -35,7 +38,7 @@ export function createBridgeLogger(options: {
     file = undefined;
   }
   const emit = (level: LogLevel, message: string, payload?: unknown): void => {
-    if (LEVEL_ORDER[level] < threshold) return;
+    if (LEVEL_ORDER[level] < thresholdOf()) return;
     let line = message;
     if (payload !== undefined) {
       try {

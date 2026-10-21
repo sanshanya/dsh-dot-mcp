@@ -327,6 +327,14 @@ export interface GoalWaitResult {
   question?: { question_id: string };
   progress_delta?: unknown;
   cleanup_warning?: string;
+  /** Server-side clock marker of this snapshot (P1-04 liveness proof). */
+  heartbeat_at?: string;
+  /**
+   * Cursor health for client-driven since_seq (P1-04): expired=true when the
+   * requested seq fell out of the retention window; oldest_seq is the first
+   * sequence still answerable.
+   */
+  cursor?: { expired: boolean; oldest_seq?: number };
 }
 
 /** Shape a start/update result with the established loop contract. */

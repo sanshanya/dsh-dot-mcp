@@ -109,6 +109,8 @@ interface PendingQuestionBatch {
 /** Wire-safe approval summary shown in dsh_get_session / dsh_get_task_status. */
 export interface ApprovalSummary {
   approval_id: string;
+  /** Only `parked` ids can be settled through this bridge's dsh_approve. */
+  source: 'parked' | 'log';
   session_id: string;
   tool_name: string;
   call_id?: string;
@@ -173,6 +175,32 @@ function undecidedApprovals(events: readonly SessionEvent[]): UndecidedApproval[
     }
   }
   return [...asked.values()].filter((item) => !decided.has(item.id));
+}
+
+/**
+ * The host issues its audit UUID before dispatch but does not put it on the
+ * request. Pair at most ONE unclaimed audit record with each parked request.
+ * Call/tool/reason must agree exactly, including a missing callId: a tool name
+ * alone must never hide an unrelated approval or collapse concurrent asks.
+ */
+function approvalForRequest(
+  approvals: readonly UndecidedApproval[],
+  request: Pick<ApprovalRequestLike, 'toolName' | 'callId' | 'reason'>,
+  claimed: ReadonlySet<string>,
+): UndecidedApproval | undefined {
+  for (let index = approvals.length - 1; index >= 0; index -= 1) {
+    const item = approvals[index];
+    if (item !== undefined && !claimed.has(item.id)
+      && item.toolName === request.toolName && item.callId === request.callId && item.reason === request.reason) {
+      return item;
+    }
+  }
+  return undefined;
+}
+
+/** Keep only human answers, in the host's original question order. */
+function collectedAnswers(batch: Pick<PendingQuestionBatch, 'items' | 'answers'>): AskUserQuestionAnswer {
+  return { answers: batch.items.map((item) => batch.answers.get(item.id)).filter(isAnswer) };
 }
 
 /** An ask_user_question tool call that has not yet produced a tool/result. */
@@ -313,18 +341,21 @@ export class AskRelay {
     }));
     const answers = new Map<string, AskUserQuestionAnswerItem>();
     return new Promise<AskUserQuestionAnswer>((resolve) => {
+      let settled = false;
       const cleanup = () => {
         this.questionBatches.delete(batchId);
         for (const item of items) this.questions.delete(item.id);
       };
       const settle = (answer: AskUserQuestionAnswer) => {
+        if (settled) return;
+        settled = true;
         request.signal?.removeEventListener('abort', abort);
         cleanup();
         resolve(answer);
       };
       // Aborting (turn cancelled / bridge disposed) fails the ask closed with the
       // answers the human already gave — never with invented ones.
-      const abort = () => settle({ answers: items.map((item) => answers.get(item.id)).filter(isAnswer) });
+      const abort = () => settle(collectedAnswers({ items, answers }));
       this.questionBatches.set(batchId, {
         ...(sessionId === undefined ? {} : { sessionId }),
         ...(callId === undefined ? {} : { callId }),
@@ -342,7 +373,11 @@ export class AskRelay {
         });
       }
       request.signal?.addEventListener('abort', abort, { once: true });
-      this.log.info(`question ${batchId} pending for session ${sessionId ?? '(no agent)'} (${items.length} item(s))`);
+      // Log mining/dispatch can happen after cancellation, before the listener
+      // exists. Adding a listener to an already-aborted signal does not fire it.
+      if (request.signal?.aborted) abort();
+      else if (items.length === 0) settle({ answers: [] });
+      else this.log.info(`question ${batchId} pending for session ${sessionId ?? '(no agent)'} (${items.length} item(s))`);
     });
   }
 
@@ -378,32 +413,36 @@ export class AskRelay {
    * dsh_approve 落地；turn 中止/清理一律 fail-closed 为 'cancelled'。
    */
   private parkApproval(request: ApprovalRequestLike, command?: string): Promise<ApprovalOutcome> {
+    // The host may have queued its waterfall before abort won its own race.
+    // That late dispatch must not leave a new, unanswerable parked request.
+    if (request.signal?.aborted) return Promise.resolve('cancelled');
     const id = `approval-${randomUUID()}`;
-    const pending: PendingApproval = {
-      id,
-      sessionId: request.agent.id,
-      toolName: request.toolName,
-      callId: request.callId,
-      reason: request.reason,
-      ...(command === undefined ? {} : { command }),
-      resolve: () => {},
-    };
-    const decision = new Promise<ApprovalOutcome>((resolve) => {
-      pending.resolve = resolve;
+    return new Promise<ApprovalOutcome>((resolve) => {
+      let settled = false;
+      const settle = (outcome: ApprovalOutcome) => {
+        if (settled) return;
+        settled = true;
+        request.signal?.removeEventListener('abort', abort);
+        this.approvals.delete(id);
+        resolve(outcome);
+      };
+      const abort = () => {
+        settle('cancelled');
+        this.log.info(`approval ${id} withdrawn (turn aborted)`);
+      };
+      this.approvals.set(id, {
+        id,
+        sessionId: request.agent.id,
+        toolName: request.toolName,
+        callId: request.callId,
+        reason: request.reason,
+        ...(command === undefined ? {} : { command }),
+        resolve: settle,
+      });
+      request.signal?.addEventListener('abort', abort, { once: true });
+      if (request.signal?.aborted) abort();
+      else this.log.info(`approval ${id} pending for session ${request.agent.id} (tool ${request.toolName})`);
     });
-    this.approvals.set(id, pending);
-    this.log.info(`approval ${id} pending for session ${request.agent.id} (tool ${request.toolName})`);
-    request.signal?.addEventListener(
-      'abort',
-      () => {
-        if (this.approvals.delete(id)) {
-          this.log.info(`approval ${id} withdrawn (turn aborted)`);
-          pending.resolve('cancelled');
-        }
-      },
-      { once: true },
-    );
-    return decision;
   }
 
   /** Decide one parked approval. Ids are exact; a foreign session is refused. */
@@ -470,7 +509,7 @@ export class AskRelay {
     const remaining = batch.items.filter((item) => !batch.answers.has(item.id));
     if (remaining.length === 0) {
       // Every question answered: hand the host the batch in the order it asked.
-      batch.resolve({ answers: batch.items.map((item) => batch.answers.get(item.id)).filter(isAnswer) });
+      batch.resolve(collectedAnswers(batch));
       this.log.info(`question ${questionId} answered; batch complete`);
       return { answered: true, remaining_questions: 0 };
     }
@@ -488,13 +527,23 @@ export class AskRelay {
    * answerable ids), then asks only the session log knows about.
    */
   waitingFor(sessionId: string, events?: readonly SessionEvent[]): WaitingState {
-    const seenApprovals = new Set<string>();
+    const parkedApprovals = [...this.approvals.values()].filter((pending) => pending.sessionId === sessionId);
+    const loggedApprovals = events === undefined ? [] : undecidedApprovals(events);
+    const loggedApprovalIds = new Set(loggedApprovals.map((item) => item.id));
+    const seenApprovals = new Set(parkedApprovals.map((pending) => pending.id));
     const approvals: ApprovalSummary[] = [];
-    for (const pending of this.approvals.values()) {
-      if (pending.sessionId !== sessionId) continue;
-      seenApprovals.add(pending.id);
+    for (const pending of parkedApprovals) {
+      // Consume only one native record per parked request, recomputing from
+      // the current undecided log. The host dispatches in a microtask: identical
+      // concurrent requests may have both been logged before either parks, so
+      // pinning an inferred native UUID forever can recreate duplicates later.
+      if (!loggedApprovalIds.has(pending.id)) {
+        const match = approvalForRequest(loggedApprovals, pending, seenApprovals);
+        if (match !== undefined) seenApprovals.add(match.id);
+      }
       approvals.push({
         approval_id: pending.id,
+        source: 'parked',
         session_id: pending.sessionId,
         tool_name: pending.toolName,
         ...(pending.callId === undefined ? {} : { call_id: pending.callId }),
@@ -503,7 +552,7 @@ export class AskRelay {
       });
     }
     if (events !== undefined) {
-      for (const item of undecidedApprovals(events)) {
+      for (const item of loggedApprovals) {
         if (seenApprovals.has(item.id)) continue;
         // Same mining as the parked lane: an approval observed only in the log
         // (bridge restarted, or the ask never reached this process) still
@@ -511,6 +560,7 @@ export class AskRelay {
         const command = item.callId === undefined ? undefined : commandForCall(events, item.callId);
         approvals.push({
           approval_id: item.id,
+          source: 'log',
           session_id: sessionId,
           tool_name: item.toolName,
           ...(item.callId === undefined ? {} : { call_id: item.callId }),
@@ -555,30 +605,40 @@ export class AskRelay {
     return { approvals, questions };
   }
 
-  /** Fail every ask of one session closed (stop/abort): nothing waits forever. */
-  failClosed(sessionId: string): void {
+  /**
+   * Drain parked asks, fail-closed. Three passes, in an order that matters:
+   * approvals first, then batches (settled with the answers already collected —
+   * never invented ones), then question entries. A batch settle unregisters its
+   * member entries, so the last pass only ever meets what no batch claimed.
+   * With `sessionId` given, only that session's asks drain; without it, all do.
+   * Every pass iterates a snapshot: settling mutates all three maps.
+   */
+  private drain(sessionId?: string): void {
     for (const pending of [...this.approvals.values()]) {
-      if (pending.sessionId !== sessionId) continue;
+      if (sessionId !== undefined && pending.sessionId !== sessionId) continue;
       this.approvals.delete(pending.id);
       pending.resolve('cancelled');
     }
+    for (const [batchId, batch] of [...this.questionBatches]) {
+      if (sessionId !== undefined && batch.sessionId !== sessionId) continue;
+      this.questionBatches.delete(batchId);
+      batch.resolve(collectedAnswers(batch));
+    }
+    // Legacy/orphan entries have no batch accumulator to preserve.
     for (const pending of [...this.questions.values()]) {
-      if (pending.sessionId !== sessionId) continue;
+      if (sessionId !== undefined && pending.sessionId !== sessionId) continue;
       this.questions.delete(pending.id);
       pending.resolve({ answers: [] });
     }
   }
 
+  /** Fail every ask of one session closed (stop/abort): nothing waits forever. */
+  failClosed(sessionId: string): void {
+    this.drain(sessionId);
+  }
+
   /** Fail everything closed (plugin disposal). */
   clear(): void {
-    for (const pending of [...this.approvals.values()]) {
-      this.approvals.delete(pending.id);
-      pending.resolve('cancelled');
-    }
-    for (const pending of [...this.questions.values()]) {
-      this.questions.delete(pending.id);
-      pending.resolve({ answers: [] });
-    }
-    this.questionBatches.clear();
+    this.drain();
   }
 }

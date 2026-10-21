@@ -1,7 +1,7 @@
 import type { SessionEvent, SessionHeader, SessionId } from '@deepseek-ai/dsh-session';
 
 /**
- * Narrow adapter for the pinned host (dsh-* @ 0.2.0-rc.2): the persistence
+ * Narrow adapter for the pinned host (dsh-* @ 0.2.1-rc.2): the persistence
  * service offers open()/close() only (no legacy inspect), read() always
  * returns the metadata envelope, and Session state is read through
  * snapshotEvents(). Legacy fallbacks were removed when peerDeps pinned this

@@ -26,6 +26,20 @@ export interface HttpServerHandle {
   close(): Promise<void>;
 }
 
+export interface HttpServerExtras {
+  /**
+   * Live gate consulted per request: when it returns false the MCP surface is
+   * refused with 503 `bridge-disabled` (the listener stays up so the settings
+   * panel can flip it back on). Defaults to always-on.
+   */
+  isEnabled?: () => boolean;
+  /**
+   * Payload factory for `GET /status` (the settings panel's status card). The
+   * route exists only when this is provided.
+   */
+  statusReport?: () => Promise<unknown> | unknown;
+}
+
 const MAX_MCP_BODY_BYTES = 4 * 1024 * 1024; // 4MB
 
 /** Read and parse a JSON request body (empty bodies yield undefined). */
@@ -61,6 +75,32 @@ function setCors(res: ServerResponse): void {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 }
 
+/**
+ * Classify the request's browser Origin for the read-only /status route.
+ * The DSH GUI page is a same-loopback page (http://127.0.0.1:3080) and must
+ * be able to fetch it; a foreign, malicious local page carries its own
+ * cross-origin header and gets neither data nor a CORS grant. Requests with
+ * no Origin (curl, native clients) are not browser reads and pass unscoped.
+ */
+type StatusOriginVerdict =
+  | { kind: 'loopback'; origin: string }
+  | { kind: 'none' }
+  | { kind: 'foreign' };
+
+function statusOrigin(req: IncomingMessage): StatusOriginVerdict {
+  const origin = req.headers.origin;
+  if (origin === undefined || origin === 'null') return { kind: 'none' };
+  try {
+    const host = new URL(origin).hostname.toLowerCase();
+    if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]' || host.startsWith('127.')) {
+      return { kind: 'loopback', origin };
+    }
+  } catch {
+    // unparsable: treat as foreign
+  }
+  return { kind: 'foreign' };
+}
+
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.statusCode = status;
   res.setHeader('Content-Type', 'application/json');
@@ -71,6 +111,7 @@ export function startHttpServer(
   createSessionServer: () => McpServer,
   options: { host: string; port: number },
   log: BridgeLogger,
+  extras: HttpServerExtras = {},
 ): Promise<HttpServerHandle> {
   if (!isLoopbackHost(options.host)) {
     return Promise.reject(new Error(`non-loopback HTTP listeners are refused: ${options.host}`));
@@ -100,8 +141,28 @@ export function startHttpServer(
         }
         const url = req.url ?? '/';
         const path = url.split('?')[0];
+        if (path === '/status' && req.method === 'GET' && extras.statusReport !== undefined) {
+          const verdict = statusOrigin(req);
+          if (verdict.kind === 'foreign') {
+            sendJson(res, 403, { error: 'forbidden', message: 'status is only served to loopback browser pages' });
+            return;
+          }
+          if (verdict.kind === 'loopback') {
+            res.setHeader('Access-Control-Allow-Origin', verdict.origin);
+            res.setHeader('Vary', 'Origin');
+          }
+          const enabled = extras.isEnabled === undefined ? true : extras.isEnabled();
+          sendJson(res, 200, { enabled, state: enabled ? 'running' : 'disabled', health: await extras.statusReport() });
+          return;
+        }
         if (path !== '/mcp') {
           sendJson(res, 404, { error: 'not-found' });
+          return;
+        }
+        if (extras.isEnabled !== undefined && !extras.isEnabled()) {
+          // Disabled from the settings panel: the listener stays bound so the
+          // panel can still reach /status, but no MCP traffic flows.
+          sendJson(res, 503, { jsonrpc: '2.0', error: { code: -32000, message: 'bridge-disabled' }, id: null });
           return;
         }
         if (req.method !== 'POST') {

@@ -249,7 +249,7 @@ test('Test F — cleanup removes goal-owned temps and keeps unrelated files', ()
   }
 });
 
-test('discoverTempResources only records worktree / release-verify / notes / tarball', () => {
+test('discoverTempResources does not infer ownership from successful creation-like calls', () => {
   const workspace = mkdtempSync(join(tmpdir(), 'dsh-bridge-discover-'));
   try {
     const events = [
@@ -308,9 +308,8 @@ test('discoverTempResources only records worktree / release-verify / notes / tar
       goalId: 'g1',
       workspacePath: workspace,
     });
-    assert.ok(found.some((item) => item.kind === 'worktree'));
-    assert.ok(found.some((item) => /release-notes-v0\.2\.0\.md$/i.test(item.path)));
-    assert.equal(found.some((item) => /README\.md$/i.test(item.path)), false);
+    assert.equal(foldSessionFacts(events).tools.length, 3, 'successful tool calls remain observable facts');
+    assert.deepEqual(found, [], 'successful calls and release-style names do not prove temporary ownership');
   } finally {
     rmSync(workspace, { recursive: true, force: true });
   }

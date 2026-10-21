@@ -80,20 +80,24 @@ test('session-read: a null or empty cached title is no hint (the host wire is st
   assert.equal(cachedTitle({ cachedSnapshot: () => ({ asOfSeq: 1, values: {} }) }, header()), undefined);
 });
 
-test('session-read: absent row fields are omitted, never sent as null', () => {
+test('session-read: unknown values are explicit markers, never key absence (E02)', () => {
   assert.deepEqual(sessionSummary({ header: header({ cwd: '/tmp/ws' }) }), {
     session_id: 's-1',
     workspace: '/tmp/ws',
+    status: 'unknown',
     created_at: new Date(1_700_000_000_000).toISOString(),
+    updated_at: null,
+    live: false,
   });
   assert.deepEqual(
-    sessionSummary({ header: header(), title: 't', status: 'idle', updatedAt: '2026-01-01T00:00:00.000Z' }),
+    sessionSummary({ header: header(), title: 't', status: 'idle', updatedAt: '2026-01-01T00:00:00.000Z', live: true }),
     {
       session_id: 's-1',
       title: 't',
       status: 'idle',
       created_at: new Date(1_700_000_000_000).toISOString(),
       updated_at: '2026-01-01T00:00:00.000Z',
+      live: true,
     },
   );
 });

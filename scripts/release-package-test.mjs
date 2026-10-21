@@ -1,4 +1,4 @@
-// Build first. Install the actual tarball and exact official host into a fresh
+// Always rebuild first. Install the actual tarball and exact official host into a fresh
 // directory; never install into a user's DSH profile or reuse its credentials.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
@@ -22,11 +22,17 @@ function run(args, cwd, capture = false, timeoutMs = 300000) {
   return result.stdout;
 }
 try {
+  // Verify the clean target, then rebuild inside this gate. Module-name checks
+  // alone cannot distinguish stale, same-named compiled files from current code.
+  const lib = join(realpathSync(root), 'lib');
+  if (existsSync(lib)) assert.equal(realpathSync(lib), lib, 'refuse an unexpected build-clean target');
+  assert.equal(dirname(lib), realpathSync(root));
+  run([npmCli, 'run', 'build'], root);
   const [pack] = JSON.parse(run([npmCli, 'pack', '--json', '--ignore-scripts', '--pack-destination', temp], root, true));
   assert.equal(pack.version, manifest.version);
   assert.ok(pack.files.every(({ path }) => !/(^test\/|test-tmp|openai-codex-oss-application|node_modules|\.env(?:\.|$)|\.(pem|key)$)/i.test(path)));
   const packedPaths = new Set(pack.files.map(({ path }) => path));
-  for (const path of ['lib/index.js', 'lib/types/index.d.ts', 'cordis.patch.yml', 'LICENSE']) {
+  for (const path of ['lib/index.js', 'lib/types/index.d.ts', 'cordis.patch.yml', 'README.md', 'ARCHITECTURE.md', 'LICENSE']) {
     assert.ok(packedPaths.has(path), `Missing package entry: ${path}`);
   }
   // `lib/` is a build product, so a module deleted from `src/` can survive in
@@ -39,6 +45,9 @@ try {
   const compiled = [...packedPaths]
     .filter((path) => /^lib\/[^/]+\.js$/.test(path))
     .map((path) => path.slice('lib/'.length, -'.js'.length))
+    // The browser bundle is authored from src/client + src/shared, not one
+    // src/<name>.ts module, so it is an expected top-level artifact, not a ghost.
+    .filter((name) => name !== 'client')
     .sort();
   const declared = [...packedPaths]
     .filter((path) => /^lib\/types\/[^/]+\.d\.ts$/.test(path))

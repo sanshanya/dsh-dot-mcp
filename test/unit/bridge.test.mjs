@@ -203,6 +203,52 @@ test('sendMessage: unknown session rejected', async () => {
   });
 });
 
+async function sendToCreatedSession(bridge, mode) {
+  const view = await bridge.createSession('ws-1', 'modes');
+  return bridge.sendMessage(view.session_id, `mode ${mode ?? 'queue'}`, undefined, mode);
+}
+
+test('sendMessage default mode=queue dispatches followup only', async () => {
+  const { bridge, agents, created } = makeStatefulBridge();
+  await sendToCreatedSession(bridge, undefined);
+  const agent = agents.get(created[0]);
+  assert.deepEqual(agent.calls, ['followup']);
+  assert.equal(agent.lastSteer, undefined);
+  assert.equal(agent.lastCancel, undefined);
+});
+
+test('sendMessage mode=steer dispatches agent.steer (step boundary, no abort)', async () => {
+  const { bridge, agents, created } = makeStatefulBridge();
+  await sendToCreatedSession(bridge, 'steer');
+  const agent = agents.get(created[0]);
+  assert.deepEqual(agent.calls, ['steer']);
+  assert.equal(agent.lastSteer.source.kind, 'user');
+  assert.equal(agent.lastCancel, undefined);
+});
+
+test('sendMessage mode=interrupt cancels with keepInbox then follows, in that order', async () => {
+  const { bridge, agents, created } = makeStatefulBridge();
+  await sendToCreatedSession(bridge, 'interrupt');
+  const agent = agents.get(created[0]);
+  assert.deepEqual(agent.calls, ['cancel', 'followup']);
+  assert.deepEqual(agent.lastCancel.options, { keepInbox: true });
+  assert.deepEqual(agent.lastCancel.cause, { kind: 'user' });
+});
+
+test('sendMessage request_id replays only an identical mode; a different mode conflicts', async () => {
+  const { bridge, agents, created } = makeStatefulBridge();
+  const view = await bridge.createSession('ws-1', 'idem');
+  const sessionId = view.session_id;
+  await bridge.sendMessage(sessionId, 'direct', 'req-m', 'interrupt');
+  const replay = await bridge.sendMessage(sessionId, 'direct', 'req-m', 'interrupt');
+  assert.equal(replay.replayed, true);
+  assert.equal(agents.get(created[0]).calls.length, 2); // cancel + followup once
+  await assert.rejects(
+    () => bridge.sendMessage(sessionId, 'direct', 'req-m', 'steer'),
+    (error) => error.code === 'IDEMPOTENCY_CONFLICT'
+  );
+});
+
 function makeLiveAgent(id, workspacePath, extras = {}) {
   const events = extras.events ?? [];
   const inbox = extras.inbox ?? { nextTurn: [], nextStep: [], hasPending: false };
@@ -218,13 +264,27 @@ function makeLiveAgent(id, workspacePath, extras = {}) {
       requestHeader: () => undefined,
     },
     followup(message) {
+      agent.calls = agent.calls ?? [];
+      agent.calls.push('followup');
       agent.lastFollowup = message;
       agent.status = extras.followupStatus ?? 'running';
       inbox.hasPending = true;
       inbox.nextTurn = inbox.nextTurn ?? [];
       inbox.nextTurn.push({ id: 'm' });
     },
-    cancel() {
+    steer(message) {
+      agent.calls = agent.calls ?? [];
+      agent.calls.push('steer');
+      agent.lastSteer = message;
+      agent.status = 'running';
+      inbox.hasPending = true;
+      inbox.nextStep = inbox.nextStep ?? [];
+      inbox.nextStep.push({ id: 's' });
+    },
+    cancel(cause, options) {
+      agent.calls = agent.calls ?? [];
+      agent.calls.push('cancel');
+      agent.lastCancel = { cause, options };
       agent.status = 'idle';
       inbox.hasPending = false;
       inbox.nextTurn = [];
@@ -535,12 +595,12 @@ function settle(agent) {
   agent.inbox.nextTurn = [];
 }
 
-test('MCP surface exposes 21 dsh_* tools (v0.5.0 Control Plane Reliability)', async () => {
+test('MCP surface exposes 22 dsh_* tools (22 = 21 frozen names + dsh_message_status, v0.8.0)', async () => {
   const src = await import('node:fs');
   // The declaration table owns the count; `mcp.ts` only builds the server now.
   const text = src.readFileSync(new URL('../../src/tools.ts', import.meta.url), 'utf8');
   const count = [...text.matchAll(/server\.registerTool\(/g)].length;
-  assert.equal(count, 21);
+  assert.equal(count, 22);
   const surface = src.readFileSync(new URL('../../src/mcp.ts', import.meta.url), 'utf8');
   assert.doesNotMatch(surface, /server\.registerTool\(/, 'declarations belong in tools.ts');
   assert.match(text, /dsh_update_goal/);

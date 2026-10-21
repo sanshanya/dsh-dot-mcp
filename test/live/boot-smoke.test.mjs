@@ -85,7 +85,7 @@ async function rpc(url, method, params) {
 }
 
 const dshDir = process.env.BRIDGE_DSH_DIR;
-test('live: real host boots the packed plugin and serves the frozen 21-tool wire', {
+test('live: real host boots the packed plugin and serves the frozen 22-tool wire', {
   skip: dshDir === undefined || dshDir.trim() === '',
   timeout: 300_000,
 }, async (t) => {
