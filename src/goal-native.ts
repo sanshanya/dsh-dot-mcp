@@ -311,6 +311,8 @@ export interface GoalStartResult {
   next_tool_call?: { tool: string; arguments: Record<string, unknown> };
   existing_goal_reused?: boolean;
   revision_unchanged?: boolean;
+  /** Set by action=pause: the revision the goal was parked at (same value as goal.revision). */
+  checkpoint_revision?: number;
 }
 
 /** Wire output of dsh_wait_goal / dsh_wait_until_action_required. */

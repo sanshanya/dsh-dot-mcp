@@ -4,6 +4,7 @@ import { isVolatile, type Volatile } from '@deepseek-ai/cosmokit';
 import z from '@deepseek-ai/schemastery';
 import type { LogLevel } from './log.js';
 import { CONFIG_DEFAULTS } from './shared/defaults.js';
+import type { Surface } from './shared/surface.js';
 
 /**
  * Plugin configuration (schemastery schema, DSH convention). All defaults are
@@ -47,6 +48,15 @@ export const ConfigSchema = z.object({
    * Volatile: flips live from the DSH settings UI without a host restart.
    */
   enabled: z.boolean().default(CONFIG_DEFAULTS.enabled).volatile(),
+  /**
+   * Tool surface served by `tools/list`. `core` (default) is one door per
+   * intent; `full` adds the goal aliases, the long-form session inspector and
+   * the diagnostic doors. This is a PERMISSION surface: a name outside it is
+   * not registered, so calling it returns `-32602 not found`.
+   * Volatile: switching takes effect on the next `tools/list` (HTTP is
+   * stateless and builds a server per request); stdio needs a restart.
+   */
+  surface: z.union([z.const('core'), z.const('full')]).default(CONFIG_DEFAULTS.surface).volatile(),
 });
 
 /** A schema value that may arrive as a live cosmokit Volatile handle or a plain constant (unit fixtures). */
@@ -71,6 +81,7 @@ export interface BridgeConfigInput {
   logLevel?: VolatileConfig<LogLevel>;
   autoApproveEscalations?: VolatileConfig<boolean>;
   enabled?: VolatileConfig<boolean>;
+  surface?: VolatileConfig<Surface>;
 }
 
 /** Fully resolved configuration. Volatile fields keep their live handles; read them through `liveValue`. */
@@ -85,6 +96,7 @@ export interface ResolvedBridgeConfig {
   logLevel: VolatileConfig<LogLevel>;
   autoApproveEscalations: VolatileConfig<boolean>;
   enabled: VolatileConfig<boolean>;
+  surface: VolatileConfig<Surface>;
   dshHome: string;
 }
 
@@ -160,6 +172,7 @@ export function resolveConfig(
     logLevel: input.logLevel ?? CONFIG_DEFAULTS.logLevel,
     autoApproveEscalations: input.autoApproveEscalations ?? CONFIG_DEFAULTS.autoApproveEscalations,
     enabled: input.enabled ?? CONFIG_DEFAULTS.enabled,
+    surface: input.surface ?? CONFIG_DEFAULTS.surface,
     dshHome,
   };
 }

@@ -14,4 +14,6 @@ export const CONFIG_DEFAULTS = {
   logLevel: 'info',
   autoApproveEscalations: false,
   enabled: true,
+  /** Tool surface: `core` (one door per intent) or `full` (adds aliases + diagnostics). */
+  surface: 'core',
 } as const;

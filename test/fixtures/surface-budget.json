@@ -1,0 +1,15 @@
+{
+  "baseline_0_8_0": 19725,
+  "core": {
+    "tools": 15,
+    "maxTotal": 11000,
+    "maxTool": 1400,
+    "maxDescription": 260
+  },
+  "full": {
+    "tools": 22,
+    "maxTotal": 15500,
+    "maxTool": 1400,
+    "maxDescription": 260
+  }
+}

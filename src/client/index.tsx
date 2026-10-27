@@ -24,7 +24,7 @@ export const inject = ['locale', 'configForms', 'slots'];
 
 type FieldKey =
   | 'resultMaxChars' | 'resultMaxItems' | 'sessionMaxItems' | 'sessionMaxChars'
-  | 'logLevel' | 'autoApproveEscalations';
+  | 'logLevel' | 'autoApproveEscalations' | 'surface';
 
 interface FieldSpec {
   key: FieldKey;
@@ -40,6 +40,7 @@ const EDITABLE_FIELDS: readonly FieldSpec[] = [
   { key: 'sessionMaxChars', labelKey: 'fieldSessionMaxChars', kind: 'number' },
   { key: 'logLevel', labelKey: 'fieldLogLevel', kind: 'enum', options: ['debug', 'info', 'warn', 'error'] },
   { key: 'autoApproveEscalations', labelKey: 'fieldAutoApprove', kind: 'boolean' },
+  { key: 'surface', labelKey: 'fieldSurface', kind: 'enum', options: ['core', 'full'] },
 ];
 
 /** The fields the status card polls from GET <endpoint>/status. */

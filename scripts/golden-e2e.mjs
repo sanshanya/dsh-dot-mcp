@@ -153,6 +153,21 @@ check('dsh_health: bridge + dsh versions', typeof health.bridge?.version === 'st
 check('dsh_health: the control-plane capabilities are advertised',
   health.capabilities?.userQuestions === true && health.capabilities?.approvals === true && health.capabilities?.goalSupervision === true,
   JSON.stringify(health.capabilities));
+// 0.9.0: this lane drives EVERY frozen door end to end, so the instance under
+// test must opt into the `full` surface. A core instance would fail every
+// full-only section with `not found` and the ledger would look like a product
+// bug instead of a recipe error — say so up front instead.
+if (health.surface?.tier !== 'full') {
+  console.error(`\nthe golden lane drives every frozen door, so it needs a FULL-surface instance.`);
+  console.error(`this instance serves '${health.surface?.tier ?? 'unknown'}' (${health.surface?.tool_count ?? '?'} tools).`);
+  console.error(`set  plugins: { 'dot-mcp': { surface: 'full' } }  in ${DSH_HOME}/cordis.patch.yml and retry.`);
+  process.exit(2);
+}
+check('dsh_health: the surface self-report names the served vocabulary',
+  health.surface?.tier === 'full' && health.surface?.tool_count === 22
+  && typeof health.surface?.tools_sha256 === 'string',
+  `${health.surface?.tool_count} tools · ${health.surface?.tools_sha256}`);
+
 check('dsh_health: instance metadata makes the running artifact traceable',
   typeof health.bridge?.instance_id === 'string' && typeof health.bridge?.artifact_sha256 === 'string'
   && typeof health.bridge?.build_time === 'string' && health.bridge?.schema_version === '0.8',

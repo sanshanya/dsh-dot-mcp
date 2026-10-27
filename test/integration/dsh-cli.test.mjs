@@ -12,7 +12,7 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { FROZEN_TOOL_NAMES } from './frozen-wire.mjs';
+import { CORE_TOOL_NAMES, FROZEN_TOOL_NAMES } from './frozen-wire.mjs';
 
 const require = createRequire(import.meta.url);
 async function freePort() {
@@ -114,7 +114,10 @@ test('isolated official Web CLI loads bridge, preserves auth/origin and serves M
     const tools = await client.listTools();
     // Set equality against the shared literal: a count alone let the wire shrink
     // under a stale `23` without this lane noticing. See frozen-wire.mjs.
-    assert.deepEqual(tools.tools.map(tool => tool.name).sort(), [...FROZEN_TOOL_NAMES].sort());
+    // 0.9.0: a fresh deployment serves `core` (one door per intent); `full` is
+    // opt-in and is pinned by the unit lane.
+    assert.deepEqual(tools.tools.map(tool => tool.name).sort(), [...CORE_TOOL_NAMES].sort());
+    assert.ok(FROZEN_TOOL_NAMES.length > CORE_TOOL_NAMES.length);
     stage = 'MCP health';
     const health = await client.callTool({ name: 'dsh_health', arguments: {} });
     assert.notEqual(health.isError, true);
@@ -135,9 +138,18 @@ test('isolated official Web CLI loads bridge, preserves auth/origin and serves M
     assert.ok(created.session_id);
     assert.equal(created.status, 'idle');
     stage = 'MCP get created session';
-    const view = resultOf(await client.callTool({ name: 'dsh_get_session', arguments: { session_id: created.session_id } }));
+    // 0.9.0: the long-form inspector merged into the task-status door. The
+    // default projection must still answer, and detail=session must still
+    // carry the title — both are asserted here rather than in the unit lane.
+    const compact = resultOf(await client.callTool({ name: 'dsh_get_task_status', arguments: { session_id: created.session_id } }));
+    assert.equal(compact.session_id, created.session_id);
+    assert.equal('title' in compact, false, 'detail=status must stay the cheap projection');
+    const view = resultOf(await client.callTool({ name: 'dsh_get_task_status', arguments: {
+      session_id: created.session_id, detail: 'session',
+    } }));
     assert.equal(view.session_id, created.session_id);
     assert.equal(view.title, 'Isolated preset contract');
+    assert.ok(Array.isArray(view.messages), 'detail=session must carry the message rows');
     stage = 'Web HTML';
     const unauthenticated = await fetch(`http://127.0.0.1:${webPort}/`, { signal: AbortSignal.timeout(3000) });
     assert.equal(unauthenticated.status, 401); // host web login, NOT bridge auth

@@ -4,7 +4,7 @@
  * ctx.sessionPersistence / ctx.sessionTitle / ctx.workspaceRegistry and
  * answers ctx.approval + ctx.userQuestions through their plugin seams.
  */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -77,6 +77,12 @@ import { idempotencyKindFor } from './command-classify.js';
 import { AskRelay, type WaitingState } from './ask-relay.js';
 import { buildResultSchema, type ResultSchema } from './result-schema.js';
 import { selectResultEvents } from './result-scope.js';
+import {
+  DEFAULT_SURFACE,
+  TOOL_REPLACEMENTS,
+  toolsForSurface,
+  type Surface,
+} from './shared/surface.js';
 import { inspectCredentials, type CredentialStatus } from './credentials.js';
 import { BRIDGE_NAME, BRIDGE_VERSION } from './version.js';
 import { pathsEqual } from './paths.js';
@@ -84,6 +90,11 @@ import { pathsEqual } from './paths.js';
 import { BridgeError } from './errors.js';
 export { BridgeError };
 
+
+/** Stable fingerprint of the names a surface serves, for cache invalidation. */
+function surfaceFingerprint(surface: Surface): string {
+  return createHash('sha256').update(toolsForSurface(surface).join('\n')).digest('hex').slice(0, 16);
+}
 
 export interface HealthReport {
   status: string;
@@ -112,6 +123,18 @@ export interface HealthReport {
     workspaces: number;
     webSurface: boolean;
     goalSupervision: boolean;
+  };
+  /**
+   * The surface this server instance was built for. `tools_sha256` is a hash of
+   * the served names, so a client can tell "my cached list is stale" without
+   * diffing names and without trusting a hand-maintained version integer.
+   */
+  surface: {
+    tier: Surface;
+    tool_count: number;
+    tools_sha256: string;
+    /** Names that exist only on the `full` surface → the core door that owns the verb. */
+    replacements: Readonly<Record<string, string>>;
   };
 }
 
@@ -517,7 +540,7 @@ export class Bridge {
 
   // ── operations ────────────────────────────────────────────────────────────
 
-  async health(): Promise<HealthReport> {
+  async health(surface: Surface = DEFAULT_SURFACE): Promise<HealthReport> {
     const agents = this.ctx.agents.list();
     let persisted = 0;
     try {
@@ -561,6 +584,12 @@ export class Bridge {
         // whichever host generation boots us.
         webSurface: this.ctx.get('webApp') !== undefined || this.ctx.get('webRuntime') !== undefined,
         goalSupervision: true,
+      },
+      surface: {
+        tier: surface,
+        tool_count: toolsForSurface(surface).length,
+        tools_sha256: surfaceFingerprint(surface),
+        replacements: TOOL_REPLACEMENTS,
       },
     };
   }
@@ -1015,7 +1044,24 @@ export class Bridge {
     return totalMaxChars === undefined ? built : this.enforceTotalBudget(built, totalMaxChars);
   }
 
-  async getTaskStatus(sessionId: string): Promise<{
+  /**
+   * One session read with two projections. `detail='status'` (default) is the
+   * historical task-status shape, byte for byte. `detail='session'` adds the
+   * long-form fields the retired `dsh_get_session` served (title, workspace,
+   * created_at, agent, bounded messages) — a strict superset, so nothing that
+   * used to be reachable became unreachable.
+   *
+   * The workspace-lock release below is a WRITE side effect that has always
+   * lived on this read path; `detail='session'` inherits it deliberately rather
+   * than silently dropping it (a dropped release leaks the lock until the next
+   * task-status poll).
+   */
+  async getTaskStatus(
+    sessionId: string,
+    detail: 'status' | 'session' = 'status',
+    maxItems?: number,
+    maxChars?: number,
+  ): Promise<{
     session_id: string;
     status: BridgeStatus;
     live: boolean;
@@ -1026,6 +1072,11 @@ export class Bridge {
     waiting: WaitingState;
     last_turn?: { turn: number; reason?: string };
     updated_at?: string;
+    title?: string;
+    workspace?: string;
+    created_at?: string;
+    agent?: { status: 'idle' | 'running'; inbox: { nextTurn: number; nextStep: number } };
+    messages?: MessageRow[];
     todos?: { content: string; status: string }[];
     goal?: NativeGoalWire;
     /** Read snapshot markers (P1-03): pair this call's fields by revision. */
@@ -1037,6 +1088,24 @@ export class Bridge {
     const pending = pendingOf(view.agent, view.events);
     const span = lastTurnSpan(view.events);
     const extras = this.sessionExtras(sessionId, view.events);
+    const session =
+      detail !== 'session'
+        ? {}
+        : {
+            ...(titleOf(view, this.ctx.sessionTitle) === undefined
+              ? {}
+              : { title: titleOf(view, this.ctx.sessionTitle) as string }),
+            ...(view.header.cwd === undefined ? {} : { workspace: view.header.cwd }),
+            created_at: iso(view.header.createdAt),
+            ...(view.agent === undefined
+              ? {}
+              : { agent: { status: view.agent.status, inbox: { nextTurn: pending.nextTurn, nextStep: pending.nextStep } } }),
+            messages: summarizeMessages(
+              view.events,
+              maxItems ?? liveValue(this.cfg.sessionMaxItems),
+              maxChars ?? liveValue(this.cfg.sessionMaxChars),
+            ),
+          };
     return {
       session_id: sessionId,
       status,
@@ -1049,6 +1118,7 @@ export class Bridge {
       waiting: this.relays.waitingFor(sessionId, view.events),
       ...(span === undefined ? {} : { last_turn: { turn: span.turn, ...(span.reason === undefined ? {} : { reason: span.reason.kind }) } }),
       updated_at: lastEventTime(view.events),
+      ...session,
       snapshot: {
         observed_at: new Date().toISOString(),
         ...(view.events.at(-1) === undefined ? {} : { last_event_seq: view.events.at(-1)!.seq }),
@@ -1323,7 +1393,7 @@ export class Bridge {
           });
         }
         throw new BridgeError('GOAL_ALREADY_EXISTS',
-          `session ${sessionId} already has a ${current.phase} native goal (revision ${current.revision}); use dsh_revise_goal or dsh_update_goal`,
+          `session ${sessionId} already has a ${current.phase} native goal (revision ${current.revision}); use dsh_update_goal`,
           { goal_id: current.id, revision: current.revision });
       }
       // Fresh work never inherits the previous goal's concurrency exemption,
@@ -1388,7 +1458,11 @@ export class Bridge {
           if (input.request_id !== undefined && input.request_id !== '') {
             this.rememberRequestId(input.request_id, { sessionId, fingerprint, goalId: native.id });
           }
-          return await this.mapStartNative(sessionId, nativeGoalWire(sessionId, native));
+          const mapped = await this.mapStartNative(sessionId, nativeGoalWire(sessionId, native));
+          // Parity with dsh_pause_goal: a pause reports the revision it parked
+          // at. The value was always inside goal.revision; surfacing it under
+          // the same key keeps the two doors interchangeable.
+          return action === 'pause' ? { ...mapped, checkpoint_revision: native.revision } : mapped;
         });
       }));
     return shared ? { ...value, existing_goal_reused: true, revision_unchanged: true } : value;

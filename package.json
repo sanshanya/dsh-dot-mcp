@@ -1,6 +1,6 @@
 {
  "name": "dsh-dot-mcp",
- "version": "0.8.0",
+ "version": "0.9.0",
  "description": "MCP bridge: exposes DeepSeek Harness (DSH) sessions, native goals, approvals and results to an MCP client through the official protocol. The bridge only connects; DSH keeps its session, agent, tool, approval and workspace security model.",
  "type": "module",
  "main": "./lib/index.js",

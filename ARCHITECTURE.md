@@ -13,10 +13,10 @@ disagree, the code is right (the last section says what that cost once).
 ## Shape
 
 ```
-ChatGPT actions ── 21 frozen tools ──▶ mcp.ts        the server object (18)
+MCP clients ────── 15 core / 22 full ──▶ mcp.ts        the server object (22)
                                           │
                                           ▼
-                                       tools.ts       the 21 declarations + zod (407)
+                                       tools.ts       the 22 declarations + zod (556)
                                           │  safe() from mcp-result.ts (47)
                                           ▼
                                      bridge.ts        the facade the tools map onto:
@@ -60,7 +60,7 @@ copy).
 
 | Module | Owns | Depends on |
 | --- | --- | --- |
-| `tools.ts` | the 21 tool declarations, their zod schemas, and the one Bridge verb each maps onto. One table, no state: the wire contract's source side | `bridge`, `mcp-result` |
+| `tools.ts` | the 22 tool declarations, their zod schemas, and the one Bridge verb each maps onto. One table split by surface (`core` 15 / `full` 22), no state: the wire contract's source side | `bridge`, `mcp-result`, `shared/surface` |
 | `mcp-result.ts` | the MCP result convention: one JSON text block per success, `{error:{code,message}}` + `isError` per failure | `errors` |
 | `mcp.ts` | the `McpServer` object ChatGPT connects to; no declarations, no handlers | `tools`, `version` |
 | `bridge.ts` | the facade: session lifecycle, status/result views, the native-goal verbs, the workspace boundary, request-id replay, and the four thin forwarders (two wait verbs to the wait plane, `dsh_approve`/`dsh_answer_question` to the relay) | everything below |
@@ -130,7 +130,7 @@ python3 <context-governor>/scripts/context_tracker.py --repo . explain --file sr
 Four of the six surfaces got 50–98% cheaper to load. The declaration table did
 **not**, and saying otherwise would be this document lying again: a row needs the
 facade's method signatures, so its closure still contains the facade graph. The
-split bought *locality* there — 21 rows in one table, diffable against
+split bought *locality* there — 22 rows in one table, diffable against
 `test/integration/frozen-wire.mjs` — not context. The envelope got cheaper in two
 passes: first it stopped importing `BridgeError` through the facade, then the
 class itself moved to `errors.ts`, so a 700-token file no longer drags the goal
@@ -329,8 +329,9 @@ list_workspaces, credential_status`.
 Renaming any of them breaks the deployed ChatGPT actions config. The literal
 list lives in exactly one place — `test/integration/frozen-wire.mjs` — and both
 real-boundary lanes assert set-equality against it (never against `src/`, which
-could drift with the code under test). These 21 are the whole wire: an action
-config naming any other tool fails at call time.
+could drift with the code under test). These 22 are the whole wire; a deployment
+serves 15 of them on `core` (the default) or all 22 on `full`, and an action
+config naming anything outside the served set fails at call time with `not found`.
 
 ## Verification
 
@@ -339,7 +340,7 @@ config naming any other tool fails at call time.
 | Unit | `npm test` | 294 tests over synthetic contexts and isolated host-service fixtures | 294/294 |
 | Release | `npm run test:release` | packs this tree, installs the tarball + official `dsh@0.2.1-rc.2` into a throwaway dir, asserts one compiled artifact per source module (no `lib/` ghosts), runs the two real-boundary lanes there | 2/2, 68 files |
 | Live | `BRIDGE_DSH_DIR=… npm run test:live` | boots a real harness checkout in a throwaway profile on a probed free port (never the shipped 3456) and asserts the served vocabulary | 1/1, 22 tools |
-| Golden | `npm run test:golden` | drives a RUNNING instance over MCP: real model turns, both relays, the goal lifecycle, the fail-closed edges — and fails if any frozen tool was never invoked | 87 pass · 0 fail · 0 skip (21/21 happy); 70 · 0 · 1 with `autoApproveEscalations` on |
+| Golden | `npm run test:golden` | drives a RUNNING instance over MCP: real model turns, both relays, the goal lifecycle, the fail-closed edges — and fails if any frozen tool was never invoked | 87 pass · 0 fail · 0 skip (22/22 happy); 70 · 0 · 1 with `autoApproveEscalations` on |
 
 The golden lane's coverage ledger is what keeps "all 22 tools are covered" a
 checked property; the SKIP path (an instance whose preset never asks) is

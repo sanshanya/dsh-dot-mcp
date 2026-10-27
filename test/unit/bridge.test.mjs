@@ -685,3 +685,54 @@ test('approve / answer do not increment revision', async () => {
   assert.equal(status.goal.revision, 1);
 });
 
+
+// ── 0.9.0 read merge ────────────────────────────────────────────────────────
+
+const SESSION_ONLY_KEYS = ['title', 'workspace', 'created_at', 'agent', 'messages'];
+
+test('F2: detail=session is a strict superset of the retired get_session view', async () => {
+  const { bridge, agents } = makeStatefulBridge();
+  const started = await bridge.startGoal({ workspace: 'ws-1', goal: 'inspect me' });
+  const agent = agents.get(started.session_id);
+  settle(agent);
+  agent.session.events.push(
+    ev('turn/start', { turn: 1 }, 0),
+    ev('message/user', { text: 'hello' }, 1),
+    ev('turn/end', { turn: 1, reason: { kind: 'completed' } }, 2),
+  );
+
+  const session = await bridge.getSession(started.session_id);
+  const merged = await bridge.getTaskStatus(started.session_id, 'session');
+  for (const key of Object.keys(session)) {
+    assert.ok(key in merged, `detail=session must still answer "${key}" (get_session answered it)`);
+  }
+  assert.deepEqual(merged.messages, session.messages);
+});
+
+test('F3/F9: the default projection is unchanged and still releases the workspace lock', async () => {
+  const { bridge } = makeStatefulBridge();
+  const started = await bridge.startGoal({ workspace: 'ws-1', goal: 'lock me' });
+
+  const status = await bridge.getTaskStatus(started.session_id);
+  for (const key of SESSION_ONLY_KEYS) {
+    assert.equal(key in status, false, `detail=status must not start emitting ${key}: polling cost would jump`);
+  }
+
+  // The lock release on this read path is a side effect the merge must keep —
+  // rebuilding the merged tool on get_session would silently leak the lock.
+  let releases = 0;
+  const original = bridge.releaseWorkspaceIfTerminal.bind(bridge);
+  bridge.releaseWorkspaceIfTerminal = (...args) => { releases += 1; return original(...args); };
+  await bridge.getTaskStatus(started.session_id);
+  assert.equal(releases, 1, 'detail=status must release the lock');
+  await bridge.getTaskStatus(started.session_id, 'session');
+  assert.equal(releases, 2, 'detail=session must release the lock too');
+});
+
+test('D-3: a pause through dsh_update_goal reports checkpoint_revision like dsh_pause_goal', async () => {
+  const { bridge } = makeStatefulBridge();
+  const started = await bridge.startGoal({ workspace: 'ws-1', goal: 'pause me' });
+  const paused = await bridge.updateGoal({ session_id: started.session_id, action: 'pause' });
+  assert.equal(typeof paused.checkpoint_revision, 'number');
+  assert.equal(paused.checkpoint_revision, paused.goal.revision);
+});

@@ -1,5 +1,5 @@
 import { test } from 'node:test';
-import { FROZEN_TOOL_NAMES } from '../integration/frozen-wire.mjs';
+import { CORE_TOOL_NAMES, FROZEN_TOOL_NAMES, FULL_ONLY_TOOL_NAMES } from '../integration/frozen-wire.mjs';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:net';
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
@@ -9,30 +9,6 @@ import { apply, name, Config } from '../../lib/index.js';
 import { createMcpServer } from '../../lib/mcp.js';
 import { startHttpServer } from '../../lib/http.js';
 
-const EXPECTED_TOOLS = [
-  'dsh_answer_question',
-  'dsh_approve',
-  'dsh_cancel_task',
-  'dsh_create_goal',
-  'dsh_create_session',
-  'dsh_credential_status',
-  'dsh_get_result',
-  'dsh_get_session',
-  'dsh_get_task_status',
-  'dsh_health',
-  'dsh_list_sessions',
-  'dsh_list_workspaces',
-  'dsh_message_status',
-  'dsh_pause_goal',
-  'dsh_resume_goal',
-  'dsh_revise_goal',
-  'dsh_send_message',
-  'dsh_start_goal',
-  'dsh_stop_goal',
-  'dsh_update_goal',
-  'dsh_wait_goal',
-  'dsh_wait_until_action_required',
-];
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -121,16 +97,35 @@ test('shipped plugin entry exports name, apply, and Config', async () => {
   assert.ok(Config);
 });
 
-test('createMcpServer registers all public dsh_* tools (v0.5.0)', () => {
+test('the default surface is core: one door per intent', () => {
   const server = createMcpServer({});
   const names = Object.keys(server._registeredTools).sort();
-  assert.deepEqual(names, [...EXPECTED_TOOLS].sort());
+  assert.deepEqual(names, [...CORE_TOOL_NAMES].sort());
+  assert.equal(names.length, 15);
+});
+
+test('the full surface serves every frozen name', () => {
+  const server = createMcpServer({}, 'full');
+  const names = Object.keys(server._registeredTools).sort();
+  assert.deepEqual(names, [...FROZEN_TOOL_NAMES].sort());
   assert.equal(names.length, 22);
 });
 
+test('core and full are the same table split by surface, not two tables', () => {
+  // The whole point of the split: nothing may exist on core that full lacks,
+  // and the difference must be exactly the documented full-only doors.
+  const core = new Set(CORE_TOOL_NAMES);
+  const all = new Set(FROZEN_TOOL_NAMES);
+  for (const name of core) assert.ok(all.has(name), `${name} is on core but not frozen`);
+  assert.deepEqual(
+    [...all].filter((n) => !core.has(n)).sort(),
+    [...FULL_ONLY_TOOL_NAMES].sort(),
+  );
+});
+
 test('request_id is optional in the advertised schema wherever offered (0.7.x bug)', () => {
-  const server = createMcpServer({});
-  for (const name of EXPECTED_TOOLS) {
+  const server = createMcpServer({}, 'full');
+  for (const name of FROZEN_TOOL_NAMES) {
     const shape = server._registeredTools[name].inputSchema?.shape ?? {};
     // Exception: dsh_message_status LOOKS UP a receipt — request_id is its key,
     // not an idempotency option, and stays required.
@@ -200,10 +195,13 @@ test('current README stays aligned with the shipped MCP surface', () => {
   const manifest = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8'));
   const readme = readFileSync(new URL('../../README.md', import.meta.url), 'utf8');
 
-  // The README's version claim must track the manifest, and its tool-count claim
-  // must track the frozen wire — the literal list, never src/.
+  // The README's version claim must track the manifest, and its tool-count
+  // claims must track the frozen wire — the literal list, never src/.
+  // Since 0.9.0 there are two true counts: the default surface and the ceiling.
   assert.match(readme, new RegExp(`v${manifest.version.replaceAll('.', '\\.')}`));
-  assert.match(readme, new RegExp(`\\b${FROZEN_TOOL_NAMES.length} tools\\b`));
+  assert.match(readme, new RegExp(`\\b${CORE_TOOL_NAMES.length}\\b`), 'README must state the core count');
+  assert.match(readme, new RegExp(`\\b${FROZEN_TOOL_NAMES.length}\\b`), 'README must state the full count');
+  assert.match(readme, /surface/, 'README must document the surface switch');
 });
 
 test('startHttpServer.close stops accepting connections', async () => {

@@ -10,6 +10,7 @@ import { ConfigSchema, liveValue, resolveConfig, type BridgeConfigInput, type Re
 import { createBridgeLogger } from './log.js';
 import { createMcpServer } from './mcp.js';
 import { startHttpServer, type HttpServerHandle } from './http.js';
+import { asSurface } from './shared/surface.js';
 
 export const name = 'dot-mcp';
 
@@ -57,21 +58,24 @@ export function apply(ctx: Context, config: BridgeConfigInput): void {
     log.info('MCP stdio transport active — speak JSON-RPC on stdin/stdout');
     // Built lazily here: in HTTP mode a singleton McpServer would never have
     // been connected (per-session instances serve every request instead).
-    mcpServer = createMcpServer(bridge);
+    // stdio is a single long-lived connection: the surface is read once at boot.
+    mcpServer = createMcpServer(bridge, asSurface(liveValue(cfg.surface)));
     stdioTransport = new StdioServerTransport();
     stdioReady = mcpServer.connect(stdioTransport).catch((error) => {
       log.error(`stdio transport failed: ${error instanceof Error ? error.message : String(error)}`);
     });
   } else {
     httpReady = startHttpServer(
-      () => createMcpServer(bridge),
+      // Read inside the factory: HTTP builds a server per request, so a
+      // volatile surface flip takes effect on the next tools/list.
+      () => createMcpServer(bridge, asSurface(liveValue(cfg.surface))),
       { host: cfg.host, port: cfg.port },
       log,
       {
         // Live gate: the settings panel flips this volatile field to suspend
         // the MCP surface without unbinding the port (see GET /status).
         isEnabled: () => liveValue(cfg.enabled) !== false,
-        statusReport: () => bridge.health(),
+        statusReport: () => bridge.health(asSurface(liveValue(cfg.surface))),
       },
     );
     void httpReady.catch((error) => {

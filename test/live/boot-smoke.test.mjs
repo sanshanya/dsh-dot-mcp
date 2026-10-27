@@ -13,7 +13,7 @@
  * would strand the auth exchange — then speak real JSON-RPC to the bridge's
  * MCP endpoint and hold four pins to it:
  *
- *   1. tools/list returns EXACTLY the 21 frozen names (served vocabulary, from
+ *   1. tools/list returns EXACTLY the core surface's names (served vocabulary, from
  *      the one literal owner test/integration/frozen-wire.mjs — never imported
  *      from the code under test, which could never fail that way);
  *   2. dsh_health answers over real HTTP;
@@ -38,7 +38,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createServer } from 'node:net';
-import { FROZEN_TOOL_NAMES } from '../integration/frozen-wire.mjs';
+import { CORE_TOOL_NAMES, FROZEN_TOOL_NAMES } from '../integration/frozen-wire.mjs';
 
 const shell = process.platform === 'win32';
 const repo = new URL('../../', import.meta.url).pathname;
@@ -190,7 +190,8 @@ test('live: real host boots the packed plugin and serves the frozen 22-tool wire
   const listed = await rpc(mcpUrl, 'tools/list', {});
   const names = [...(listed.result?.tools ?? [])].map((tool) => tool.name).sort();
   // exact idiomatic set-equality imports nothing from src/ (see pin 1).
-  assert.deepEqual(names, [...FROZEN_TOOL_NAMES].sort());
+  assert.deepEqual(names, [...CORE_TOOL_NAMES].sort());
+  assert.ok(FROZEN_TOOL_NAMES.length > CORE_TOOL_NAMES.length);
 
   const health = await rpc(mcpUrl, 'tools/call', { name: 'dsh_health', arguments: {} });
   assert.equal(health.error, undefined, `dsh_health failed over the live wire: ${JSON.stringify(health.error)}`);
