@@ -22,6 +22,7 @@ import {
 import { inspectPersistedSession, persistedHeader, sessionEvents } from './session-persistence-compat.js';
 import type { Workspace } from '@deepseek-ai/dsh-workspace';
 import { liveValue, type ResolvedBridgeConfig } from './config.js';
+import { compare, fingerprint, type Fingerprint } from './code-identity.js';
 import type { BridgeLogger } from './log.js';
 import { isTerminalStatus, type BridgeStatus } from './status.js';
 import {
@@ -129,6 +130,25 @@ export interface HealthReport {
    * the served names, so a client can tell "my cached list is stale" without
    * diffing names and without trusting a hand-maintained version integer.
    */
+  /**
+   * Whether the code this process loaded still matches the tree on disk, plus —
+   * on `/status` only — the evidence behind that verdict.
+   *
+   * `current` means exactly one thing: every `.js` byte under `lib/` (browser
+   * bundle included) hashed at load is still the byte on disk. It does NOT mean
+   * the build succeeded, that a partial build did not happen, that peer
+   * dependencies are current, or that the code is correct. `unknown` is the
+   * answer whenever the scan could not run — never `current`.
+   */
+  code: {
+    state: 'current' | 'stale' | 'unknown';
+    files?: number;
+    snapshot_at?: string;
+    changed_total?: number;
+    changed?: string[];
+    stamp_matches?: boolean;
+    reason?: string;
+  };
   surface: {
     tier: Surface;
     tool_count: number;
@@ -238,14 +258,35 @@ function resolveDshVersion(): { version: string; source?: string; unknown_reason
   return { version: 'unknown', unknown_reason: 'the host CLI package (@deepseek-ai/dsh) is not resolvable from argv/cwd/module roots' };
 }
 
-/** Stamped at build time by scripts/write-buildmeta.mjs. */
-function buildMeta(): { built_at?: string; artifact_sha256?: string } {
+/**
+ * The build stamp, read ONCE at module evaluation.
+ *
+ * Reading it per health call is the 0.8.0 defect: the value described
+ * `lib/buildmeta.json` on disk, so re-running the stamp script changed what a
+ * running process claimed to be. The stamp is evidence about the build, not
+ * about the running process; the running process is identified by `BOOT_CODE`.
+ */
+function readStamp(): { built_at?: string; artifact_sha256?: string; files?: number } {
   try {
-    return JSON.parse(readFileSync(new URL('buildmeta.json', import.meta.url), 'utf8')) as { built_at?: string; artifact_sha256?: string };
+    return JSON.parse(readFileSync(new URL('buildmeta.json', import.meta.url), 'utf8')) as {
+      built_at?: string;
+      artifact_sha256?: string;
+      files?: number;
+    };
   } catch {
     return {};
   }
 }
+
+const LIB_DIR = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Identity of the artifact this process captured when it loaded. Never
+ * recomputed: it is the baseline `compare()` measures the tree against, and the
+ * value a release publishes for others to assert.
+ */
+const BOOT_CODE: Fingerprint = fingerprint(LIB_DIR);
+const BOOT_STAMP = readStamp();
 
 const INSTANCE_ID = randomUUID();
 const INSTANCE_STARTED_AT = new Date().toISOString();
@@ -556,7 +597,12 @@ export class Bridge {
 
   // ── operations ────────────────────────────────────────────────────────────
 
-  async health(surface: Surface = DEFAULT_SURFACE): Promise<HealthReport> {
+  /**
+   * `evidence: true` adds the diff (changed paths, counts, snapshot metadata) and
+   * is served on `GET /status` only. The MCP tool gets the verdict alone: a
+   * remote model cannot act on a file list, and every reader pays for it.
+   */
+  async health(surface: Surface = DEFAULT_SURFACE, options: { evidence?: boolean } = {}): Promise<HealthReport> {
     const agents = this.ctx.agents.list();
     let persisted = 0;
     try {
@@ -566,7 +612,7 @@ export class Bridge {
     }
     const workspaces = this.ctx.get('workspaceRegistry')?.list() ?? [];
     const dsh = resolveDshVersion();
-    const meta = buildMeta();
+    const freshness = compare(LIB_DIR, BOOT_CODE);
     return {
       status: 'ok',
       bridge: {
@@ -576,8 +622,10 @@ export class Bridge {
         schema_version: WIRE_SCHEMA_VERSION,
         instance_id: INSTANCE_ID,
         started_at: INSTANCE_STARTED_AT,
-        ...(meta.built_at === undefined ? {} : { build_time: meta.built_at }),
-        ...(meta.artifact_sha256 === undefined ? {} : { artifact_sha256: meta.artifact_sha256 }),
+        ...(BOOT_STAMP.built_at === undefined ? {} : { build_time: BOOT_STAMP.built_at }),
+        // The identity of the code THIS process is running, not of the tree on
+        // disk. Absent when the snapshot could not be taken.
+        ...(BOOT_CODE.sha256 === undefined ? {} : { artifact_sha256: BOOT_CODE.sha256 }),
       },
       dsh,
       runtime: { pid: process.pid, uptimeMs: Math.round(process.uptime() * 1000) },
@@ -606,6 +654,23 @@ export class Bridge {
         tool_count: toolsForSurface(surface).length,
         tools_sha256: surfaceFingerprint(surface),
         replacements: TOOL_REPLACEMENTS,
+      },
+      code: {
+        state: freshness.state,
+        ...(options.evidence !== true
+          ? {}
+          : {
+              files: BOOT_CODE.files,
+              snapshot_at: INSTANCE_STARTED_AT,
+              changed_total: freshness.changedTotal,
+              changed: freshness.changed,
+              // Answers "did the build finish and does the stamp describe this
+              // tree" — a different question from "is this process current", so
+              // it is evidence, never the verdict.
+              stamp_matches: BOOT_STAMP.artifact_sha256 !== undefined
+                && BOOT_STAMP.artifact_sha256 === BOOT_CODE.sha256,
+            }),
+        ...(freshness.reason === undefined ? {} : { reason: freshness.reason }),
       },
     };
   }

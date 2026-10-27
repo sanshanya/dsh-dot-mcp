@@ -136,6 +136,16 @@ test('v0.8 P1-05: health carries instance/build metadata; unknown carries a reas
   assert.ok(typeof report.bridge.artifact_sha256 === 'string' && report.bridge.artifact_sha256.length === 16,
     'buildmeta sha stamped at build time');
   assert.ok(report.bridge.build_time !== undefined);
+  // 0.9.2: the artifact field now identifies the code THIS process loaded, and
+  // the freshness verdict rides beside it. A build that cannot establish its
+  // own identity must say `unknown` — never `current`.
+  assert.equal(report.code.state, 'current', 'a freshly imported bridge runs the tree it just loaded');
+  assert.ok(['current', 'stale', 'unknown'].includes(report.code.state));
+  assert.equal(report.code.changed_total, undefined, 'the MCP tool must not pay for the diff');
+  const withEvidence = await bridge.health('core', { evidence: true });
+  assert.equal(withEvidence.code.state, report.code.state, '/status and the tool must agree on the verdict');
+  assert.equal(typeof withEvidence.code.files, 'number');
+  assert.equal(withEvidence.code.stamp_matches, true, 'the stamp is written by the same function as the runtime id');
   assert.ok(typeof report.dsh.version === 'string');
   if (report.dsh.version === 'unknown') {
     assert.ok(report.dsh.unknown_reason !== undefined, 'unknown must explain itself');

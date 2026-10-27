@@ -31,7 +31,7 @@ dsh plugin --profile web add /path/to/this/tree
 
 The profile pins `dsh-dot-mcp` as a `link:` dependency, so rebuilding this tree
 refreshes it; the host must recompose (reload/restart) to load new code. This
-tree is **v0.9.1** targeting DSH **0.2.1-rc.2**.
+tree is **v0.9.2** targeting DSH **0.2.1-rc.2**.
 
 ## The tools: 15 served, 22 available
 
@@ -111,6 +111,7 @@ stay file-only by design — changing a listener always needs a restart.
 | Unit | `npm test` | 298 tests: synthetic contexts, isolated host-service fixtures |
 | Release | `npm run test:release` | packs this tree, installs the tarball + official `dsh@0.2.1-rc.2` into a throwaway dir, runs the CLI lane and the real-host lane |
 | Live | `BRIDGE_DSH_DIR=... npm run test:live` | boots a real harness checkout and asserts the served `core` vocabulary |
+| Probe | `npm run probe -- --expect-sha <sha>` | read-only live check: prints the artifact identity first, asserts the running code is the build you published |
 | Golden | `npm run test:golden` | drives all 22 frozen doors over the real wire against a living **`full`-surface** test instance (last measured: 87 pass · 0 fail, 22/22 happy path) |
 
 ## License

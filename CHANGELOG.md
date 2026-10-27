@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.9.2 — 2026-10-27
+
+One artifact, one identity, one algorithm — plus a probe whose verdict is an
+assertion rather than a self-report.
+
+### Fixed
+- **`dsh_health.bridge.artifact_sha256` described the disk, not the running code.**
+  It was a `readFileSync` of `lib/buildmeta.json` on every call, so re-running the
+  stamp script alone — no rebuild, no restart — changed what a live process claimed
+  to be (`5e2f…` → `b854…`, same pid). It is now captured once at module load and
+  never re-read. **This changes the field's meaning on a 0.8-era wire field**: it now
+  identifies the code the process loaded. A client that used it to check "did my
+  build land" gets the right answer for the first time.
+- **The stamp never covered the shipped artifact.** `npm run build` stamped inside
+  `build:server`, before esbuild wrote `lib/client.js` — so the hash described a
+  tree that never existed on disk, and the browser bundle was covered by nothing.
+  The stamp now runs last and includes it; `build:server` alone no longer produces a
+  stamp, and that is deliberate (it also deletes `lib/client.js`).
+- **Three incompatible 16-hex hashes existed for the same bytes** (stamp-with-bundle,
+  stamp-without-bundle, and a proposed third scheme). `scripts/write-buildmeta.mjs`
+  and the runtime now both call `fingerprint()` from `src/code-identity.ts`; a unit
+  test asserts `buildmeta.artifact_sha256 === fingerprint(lib).sha256` so they cannot
+  drift apart again.
+
+### Added
+- **`dsh_health.code.state`** — `current | stale | unknown`, comparing a content
+  snapshot of `lib/**/*.js` (taken at load) against the tree now. `unknown` on every
+  failure path; it is never derived from the stamp. `/status` additionally carries
+  the evidence (`changed[]`, `changed_total`, `files`, `snapshot_at`, `stamp_matches`),
+  never the MCP tool: a remote model cannot act on a file list.
+- **`node scripts/probe-wire.mjs`** (`npm run probe`) — read-only, three round trips,
+  prints one invariant identity line, then volatile facts, then failures. `--expect-sha`
+  turns it into an assertion against the build you published, which is the only
+  evidence a self-reported verdict cannot fake: a clean install of an old tarball
+  also reports `current`.
+
+### Verified
+- 328 unit tests green (10 new for the identity: mtime-independence, byte-boundary
+  collisions, add/remove, stamp-proofness, bundle coverage, `unknown` discipline, and
+  the stamp/runtime equality contract).
+- `npm run probe -- --expect-sha <built sha>` against a live 0.9.1 instance: the
+  identity check passed **falsely** (0.9.1 read the stamp per call, so it reported
+  whatever had just been built) while `code.state` was absent — a live demonstration
+  of both defects, on the wire, before the fix.
+
 ## 0.9.1 — 2026-10-27
 
 Four defects found by driving the wire from a real client. None of them changed a

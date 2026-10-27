@@ -75,7 +75,7 @@ export function apply(ctx: Context, config: BridgeConfigInput): void {
         // Live gate: the settings panel flips this volatile field to suspend
         // the MCP surface without unbinding the port (see GET /status).
         isEnabled: () => liveValue(cfg.enabled) !== false,
-        statusReport: () => bridge.health(asSurface(liveValue(cfg.surface))),
+        statusReport: () => bridge.health(asSurface(liveValue(cfg.surface)), { evidence: true }),
       },
     );
     void httpReady.catch((error) => {
