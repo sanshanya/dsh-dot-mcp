@@ -197,8 +197,23 @@ export interface ResultView {
   detail: 'summary' | 'standard' | 'full';
   /** Number of rows dropped by a budget, per field (0 = nothing omitted). */
   omitted_counts: { tool_calls: number; changed_files: number };
-  /** Per-field truncation marker — never truncate a JSON structure itself. */
-  truncated: { text: boolean; tool_calls: boolean; changed_files: boolean; total?: boolean };
+  /**
+   * Per-field truncation marker — never truncate a JSON structure itself.
+   * Every flag is recomputed from the FINAL object after the total-budget
+   * ladder ran, so a flag can never disagree with `omitted_counts` (the 0.8.0
+   * bug: 38 dropped tool calls reported as `tool_calls: false`).
+   */
+  truncated: {
+    text: boolean;
+    tool_calls: boolean;
+    changed_files: boolean;
+    /** An extra (total-payload) layer was applied, on top of the per-field ones. */
+    total?: boolean;
+    /** The skeleton alone exceeded the caller's ceiling; this is what we sent. */
+    served_chars?: number;
+    budget_chars?: number;
+    over_budget?: true;
+  };
   /** Read snapshot markers: same-call freshness for status/result pairs (P1-03). */
   snapshot: { observed_at: string; last_event_seq?: number };
   /** Newest non-completed terminal turn before this one (P0-03 failure trail). */
@@ -534,7 +549,8 @@ export class Bridge {
     if (byTitle !== undefined) return byTitle;
     throw new BridgeError(
       'WORKSPACE_NOT_FOUND',
-      `no registered workspace matches "${input}"; sessions can only be created in workspaces DSH already registered (dsh_list_workspaces)`,
+      `no registered workspace matches "${input}" (checked id, path and title); ` +
+        'call dsh_list_workspaces to see the registered set — the bridge never registers a path on your behalf',
     );
   }
 
@@ -948,40 +964,82 @@ export class Bridge {
 
   /**
    * Total-payload budget (P1: a supervisor's `max_chars=800` must not be met
-   * by ~49k of sections). Applies AFTER the per-field budgets, degrading
-   * deterministically: drop result_schema, stub tool-call arguments, shrink
-   * changed_files to 5, finally re-truncate the assistant text. Sets
-   * truncated.total so callers learn an extra layer was applied.
+   * by ~49k of sections).
+   *
+   * Measured on the text the client actually receives — the pretty-printed
+   * block `mcp-result.ts` serializes. The 0.8.0 version measured the COMPACT
+   * form, which understated the payload by ~40% and is why a 1,000-char ceiling
+   * shipped 1,884 chars: the budget was never violated, it was measured against
+   * the wrong string.
+   *
+   * The ladder drops the cheapest information first and re-measures after every
+   * rung; omission counts and truncation flags are recomputed from the final
+   * object rather than carried over from the pre-ladder one.
    */
   private enforceTotalBudget(view: ResultView, budget: number): ResultView {
+    const served = (value: unknown): number => JSON.stringify(value, null, 2).length;
     let current = view;
-    const over = (): boolean => JSON.stringify(current).length > budget;
-    if (!over()) return current;
+    if (served(current) <= budget) return current;
     let total = false;
+
+    const apply = (next: ResultView): void => {
+      if (served(next) < served(current)) total = true;
+      current = next;
+    };
+
     if (current.result_schema !== undefined) {
-      const { result_schema, ...rest } = current;
-      current = rest;
-      total = true;
+      const { result_schema: _dropped, ...rest } = current;
+      apply(rest);
     }
+    const over = (): boolean => served(current) > budget;
     if (over() && current.tool_calls.some((call) => call.arguments !== '…')) {
-      current = { ...current, tool_calls: current.tool_calls.map((call) => ({ ...call, arguments: '…' })) };
-      total = true;
+      apply({ ...current, tool_calls: current.tool_calls.map((call) => ({ ...call, arguments: '…' })) });
     }
     if (over() && current.changed_files.length > 5) {
-      current = { ...current, changed_files: current.changed_files.slice(0, 5) };
-      total = true;
+      apply({ ...current, changed_files: current.changed_files.slice(0, 5) });
+    }
+    if (over() && current.tool_calls.length > 3) {
+      apply({ ...current, tool_calls: current.tool_calls.slice(0, 3) });
     }
     if (over() && current.assistant_text.length > 200) {
-      const excess = JSON.stringify(current).length - budget;
-      const keep = Math.max(200, current.assistant_text.length - excess);
-      current = { ...current, assistant_text: truncate(current.assistant_text, keep) };
-      total = true;
+      apply({ ...current, assistant_text: truncate(current.assistant_text, 200) });
     }
-    // A caller may demand less than the irreducible skeleton (status, ids,
-    // markers); in that case the skeleton stays intact — never cut JSON.
-    if (!total) return current;
-    const truncated = { ...current.truncated, total: true };
-    return { ...current, truncated };
+    if (over() && current.assistant_text.length > 0) {
+      apply({ ...current, assistant_text: '' });
+    }
+    if (over() && current.changed_files.length > 0) {
+      apply({ ...current, changed_files: [] });
+    }
+    if (over() && current.tool_calls.length > 0) {
+      apply({ ...current, tool_calls: [] });
+    }
+    if (over() && current.last_failure !== undefined) {
+      const { last_failure: _dropped, ...rest } = current;
+      apply(rest);
+    }
+
+    const droppedCalls = view.omitted_counts.tool_calls + (view.tool_calls.length - current.tool_calls.length);
+    const droppedFiles = view.omitted_counts.changed_files + (view.changed_files.length - current.changed_files.length);
+    const finalServed = served(current);
+    return {
+      ...current,
+      omitted_counts: { tool_calls: droppedCalls, changed_files: droppedFiles },
+      truncated: {
+        ...current.truncated,
+        // Same source as omitted_counts: one裁剪 produces both, so a caller can
+        // trust either.
+        tool_calls: droppedCalls > 0 || current.truncated.tool_calls,
+        changed_files: droppedFiles > 0 || current.truncated.changed_files,
+        text: view.truncated.text || current.assistant_text.length < view.assistant_text.length,
+        ...(total ? { total: true as const } : {}),
+        // The skeleton (ids, status, counts, snapshot) is irreducible. When the
+        // caller asks for less than it costs we say so — silently shipping 3x
+        // the requested ceiling is what made the old budget untrustworthy.
+        ...(finalServed > budget
+          ? { served_chars: finalServed, budget_chars: budget, over_budget: true as const }
+          : {}),
+      },
+    };
   }
 
   async getResult(sessionId: string, maxChars?: number, detail: 'summary' | 'standard' | 'full' = 'standard', totalMaxChars?: number): Promise<ResultView> {
@@ -1000,6 +1058,10 @@ export class Bridge {
       : undefined;
     // Per-field budgets (P1-01): max_chars bounded only the assistant text; the
     // tool call tail and file list got their own ceilings and omission counts.
+    // One total, two views: `rawCalls` is the capped list, `totalCalls` the real
+    // one. Omission counts and truncation flags both derive from these, so
+    // "38 dropped but tool_calls:false" cannot happen again.
+    const totalCalls = toolCallsForTurn(view.events, span.turn, Number.POSITIVE_INFINITY).length;
     const rawCalls = toolCallsForTurn(view.events, span.turn, detail === 'summary' ? 10 : items);
     const allFiles = collectChangedFiles(view.events, span.turn);
     const fileLimit = detail === 'summary' ? 5 : detail === 'full' ? Number.POSITIVE_INFINITY : 200;
@@ -1025,12 +1087,17 @@ export class Bridge {
       tool_calls: calls,
       detail,
       omitted_counts: {
-        tool_calls: Math.max(0, toolCallsForTurn(view.events, span.turn, Number.POSITIVE_INFINITY).length - calls.length),
+        tool_calls: Math.max(0, totalCalls - calls.length),
         changed_files: allFiles.length - files.length,
       },
       truncated: {
         text: text.length > chars,
-        tool_calls: rawCalls.length > calls.length || rawCalls.some((call) => call.arguments.length > 500 && detail === 'standard'),
+        // `rawCalls` was already capped, so comparing it to `calls` could never
+        // see the drop that `omitted_counts` was reporting. Compare the REAL
+        // total instead — the two fields must agree.
+        tool_calls: totalCalls > calls.length
+          || rawCalls.some((call) => call.arguments.length > 500 && detail === 'standard')
+          || (detail === 'summary' && rawCalls.some((call) => call.arguments !== '…')),
         changed_files: allFiles.length > files.length,
       },
       snapshot: {
@@ -1042,6 +1109,94 @@ export class Bridge {
       ...(resultSchema === undefined ? {} : { result_schema: resultSchema }),
     };
     return totalMaxChars === undefined ? built : this.enforceTotalBudget(built, totalMaxChars);
+  }
+
+  /**
+   * "What happens next" — the question a supervisor actually asks, and the one
+   * the field set alone cannot answer. A snapshot can be entirely accurate and
+   * still ambiguous: `status=queued` with an idle agent, a pending next-step and
+   * a completed-turn marker describes three different situations (a driver is
+   * about to run / nothing will consume it / the task already ended) depending
+   * on whether a goal is armed.
+   *
+   * This does not collapse status into one label — it names the blocker and what
+   * the caller should do, so "wait" and "push it forward" stop looking identical.
+   */
+  private nextActionOf(input: {
+    status: BridgeStatus;
+    agentStatus?: 'idle' | 'running';
+    pending: { nextTurn: number; nextStep: number };
+    waiting: WaitingState;
+    goal?: NativeGoalWire;
+  }): {
+    actionable: boolean;
+    waiting_on: 'nothing' | 'agent' | 'goal_round' | 'approval' | 'question' | 'queue' | 'human';
+    recommendation: 'wait' | 'approve' | 'answer' | 'send_message' | 'done';
+    reason: string;
+  } {
+    const { status, agentStatus, pending, waiting, goal } = input;
+    const approvals = waiting.approvals.length;
+    const questions = waiting.questions.length;
+    const armed = goal !== undefined && goal.activation === 'armed' && goal.phase === 'active';
+    const pendingCount = pending.nextTurn + pending.nextStep;
+
+    if (approvals > 0) {
+      return {
+        actionable: false,
+        waiting_on: 'approval',
+        recommendation: 'approve',
+        reason: `${approvals} approval(s) parked; nothing runs until one is decided (dsh_approve with approval_id)`,
+      };
+    }
+    if (questions > 0) {
+      return {
+        actionable: false,
+        waiting_on: 'question',
+        recommendation: 'answer',
+        reason: `${questions} question(s) parked; the agent is waiting on a human (dsh_answer_question)`,
+      };
+    }
+    if (agentStatus === 'running') {
+      return {
+        actionable: true,
+        waiting_on: armed ? 'goal_round' : 'agent',
+        recommendation: 'wait',
+        reason: armed
+          ? 'the armed goal is driving this session; rounds continue without a new push'
+          : 'the agent is mid-turn; it continues on its own',
+      };
+    }
+    if (pendingCount > 0 && armed) {
+      return {
+        actionable: true,
+        waiting_on: 'goal_round',
+        recommendation: 'wait',
+        reason: `${pendingCount} queued item(s) will be consumed by the armed goal`,
+      };
+    }
+    if (pendingCount > 0) {
+      // The 19-minute snapshot: queued work, idle agent, no driver.
+      return {
+        actionable: false,
+        waiting_on: 'queue',
+        recommendation: 'send_message',
+        reason: `${pendingCount} queued item(s) with no driver: the agent is idle and no goal is armed, so nothing will consume them — push with dsh_send_message (mode=queue) or arm a goal`,
+      };
+    }
+    if (isTerminalStatus(status)) {
+      return {
+        actionable: false,
+        waiting_on: 'nothing',
+        recommendation: 'done',
+        reason: `the last turn ended ${status}; read dsh_get_result or continue with dsh_send_message`,
+      };
+    }
+    return {
+      actionable: false,
+      waiting_on: 'human',
+      recommendation: 'send_message',
+      reason: 'idle with no pending work: nothing is scheduled, send a message to continue',
+    };
   }
 
   /**
@@ -1079,6 +1234,14 @@ export class Bridge {
     messages?: MessageRow[];
     todos?: { content: string; status: string }[];
     goal?: NativeGoalWire;
+    /** Why the session sits where it sits, and what the caller should do (0.9.1). */
+    next: {
+      /** True when something will progress this session without a new push. */
+      actionable: boolean;
+      waiting_on: 'nothing' | 'agent' | 'goal_round' | 'approval' | 'question' | 'queue' | 'human';
+      recommendation: 'wait' | 'approve' | 'answer' | 'send_message' | 'done';
+      reason: string;
+    };
     /** Read snapshot markers (P1-03): pair this call's fields by revision. */
     snapshot: { observed_at: string; last_event_seq?: number };
   }> {
@@ -1106,6 +1269,7 @@ export class Bridge {
               maxChars ?? liveValue(this.cfg.sessionMaxChars),
             ),
           };
+    const waiting = this.relays.waitingFor(sessionId, view.events);
     return {
       session_id: sessionId,
       status,
@@ -1115,7 +1279,14 @@ export class Bridge {
         ? {}
         : { execution_origin: extras.goal !== undefined && extras.goal.activation === 'armed' ? ('goal' as const) : ('manual' as const) }),
       pending,
-      waiting: this.relays.waitingFor(sessionId, view.events),
+      waiting,
+      next: this.nextActionOf({
+        status,
+        ...(view.agent === undefined ? {} : { agentStatus: view.agent.status }),
+        pending,
+        waiting,
+        ...(extras.goal === undefined ? {} : { goal: extras.goal }),
+      }),
       ...(span === undefined ? {} : { last_turn: { turn: span.turn, ...(span.reason === undefined ? {} : { reason: span.reason.kind }) } }),
       updated_at: lastEventTime(view.events),
       ...session,

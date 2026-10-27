@@ -141,3 +141,68 @@ test('get_task_status advertises detail without changing the default projection'
   assert.equal(shape.detail.safeParse(undefined).success, true, 'detail must stay optional');
   assert.ok('max_items' in shape && 'max_chars' in shape);
 });
+// ── 0.9.1: error representation and list pagination ─────────────────────────
+
+async function callTool(bridge, name, args = {}) {
+  const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+  const { InMemoryTransport } = await import('@modelcontextprotocol/sdk/inMemory.js');
+  const server = createMcpServer(bridge, 'core');
+  const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverSide);
+  const client = new Client({ name: 'probe', version: '0' });
+  await client.connect(clientSide);
+  try {
+    return await client.callTool({ name, arguments: args });
+  } finally {
+    await client.close();
+    await server.close();
+  }
+}
+
+test('P1: a failure carries ONE object in both representations', async () => {
+  const { BridgeError } = await import('../../lib/errors.js');
+  const result = await callTool({
+    async listSessions() { throw new BridgeError('WORKSPACE_NOT_FOUND', 'no such workspace'); },
+  }, 'dsh_list_sessions');
+
+  const body = JSON.parse(result.content[0].text);
+  assert.equal(result.isError, true);
+  assert.ok(result.structuredContent, 'the structured representation must exist, not be invented downstream');
+  assert.deepEqual(result.structuredContent, body, 'body and structuredContent must come from the same object');
+  assert.equal(result.structuredContent.error.code, 'WORKSPACE_NOT_FOUND');
+  assert.equal(result.structuredContent.error.retryable, false, 'an unknown workspace will not appear on retry');
+});
+
+test('P1: retryable distinguishes "try again" from "fix the input"', async () => {
+  const { BridgeError } = await import('../../lib/errors.js');
+  const locked = await callTool({
+    async listSessions() { throw new BridgeError('WORKSPACE_LOCKED', 'held by another session'); },
+  }, 'dsh_list_sessions');
+  assert.equal(locked.structuredContent.error.retryable, true);
+
+  const internal = await callTool({
+    async listSessions() { throw new Error('boom'); },
+  }, 'dsh_list_sessions');
+  assert.equal(internal.structuredContent.error.code, 'INTERNAL');
+  assert.equal(internal.structuredContent.error.retryable, false, 'an internal fault is not fixed by retrying');
+});
+
+test('P2: list_sessions says whether another page exists', async () => {
+  const rows = [
+    { id: 'a', title: 'a', status: 'idle', live: false, updated_at: null },
+    { id: 'b', title: 'b', status: 'idle', live: false, updated_at: null },
+    { id: 'c', title: 'c', status: 'idle', live: false, updated_at: null },
+  ];
+  const bridge = { async listSessions(options) { return rows.slice(options.offset ?? 0, (options.offset ?? 0) + options.limit); } };
+
+  const first = JSON.parse((await callTool(bridge, 'dsh_list_sessions', { limit: 2 })).content[0].text);
+  assert.equal(first.sessions.length, 2);
+  assert.equal(first.page.has_more, true);
+  assert.equal(first.page.next_offset, 2);
+  assert.equal(first.page.sort, 'created_at desc');
+
+  const second = JSON.parse((await callTool(bridge, 'dsh_list_sessions', { limit: 2, offset: 2 })).content[0].text);
+  assert.equal(second.sessions.length, 1);
+  assert.equal(second.page.has_more, false);
+  assert.equal('next_offset' in second.page, false, 'the last page must not imply another one');
+});

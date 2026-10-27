@@ -736,3 +736,102 @@ test('D-3: a pause through dsh_update_goal reports checkpoint_revision like dsh_
   assert.equal(typeof paused.checkpoint_revision, 'number');
   assert.equal(paused.checkpoint_revision, paused.goal.revision);
 });
+
+// ── 0.9.1: response budget, truncation flags, "what happens next" ────────────
+
+test('P1: total_max_chars bounds the text the client receives, not a compact copy', async () => {
+  const { bridge, agents } = makeStatefulBridge();
+  const started = await bridge.startGoal({ workspace: 'ws-1', goal: 'budget me' });
+  const agent = agents.get(started.session_id);
+  settle(agent);
+  const events = [
+    ev('turn/start', { turn: 1 }, 0),
+    ev('assistant/message', { turn: 1, message: { content: [{ type: 'text', text: 'x'.repeat(4000) }] } }, 1),
+  ];
+  for (let i = 0; i < 40; i += 1) {
+    events.push(
+      ev('tool/call', { turn: 1, callId: `c${i}`, name: 'bash', arguments: JSON.stringify({ command: `git status -- ${i}` }) }, 2 + i * 2),
+      ev('tool/result', { turn: 1, message: { source: { callId: `c${i}` }, content: [{ type: 'text', text: 'ok' }] } }, 3 + i * 2),
+    );
+  }
+  events.push(ev('turn/end', { turn: 1, reason: { kind: 'completed' } }, 200));
+  agent.session.events.push(...events);
+
+  for (const budget of [500, 1000, 3000]) {
+    const view = await bridge.getResult(started.session_id, 100, 'summary', budget);
+    const served = JSON.stringify(view, null, 2).length;
+    assert.ok(
+      served <= budget || view.truncated.over_budget === true,
+      `budget ${budget}: served ${served} chars without declaring the overshoot`,
+    );
+    if (view.truncated.over_budget === true) {
+      assert.equal(view.truncated.served_chars, served);
+      assert.equal(view.truncated.budget_chars, budget);
+    }
+  }
+
+  const tight = await bridge.getResult(started.session_id, 100, 'summary', 1000);
+  assert.ok(JSON.stringify(tight, null, 2).length < JSON.stringify(
+    await bridge.getResult(started.session_id, 100, 'summary', 20000), null, 2).length,
+    'a tighter ceiling must actually produce a smaller payload');
+});
+
+test('P1: omitted_counts and the truncation flags come from the same裁剪', async () => {
+  const { bridge, agents } = makeStatefulBridge();
+  const started = await bridge.startGoal({ workspace: 'ws-1', goal: 'flag me' });
+  const agent = agents.get(started.session_id);
+  settle(agent);
+  const events = [ev('turn/start', { turn: 1 }, 0)];
+  for (let i = 0; i < 40; i += 1) {
+    events.push(
+      ev('tool/call', { turn: 1, callId: `c${i}`, name: 'bash', arguments: JSON.stringify({ command: `ls ${i}` }) }, 1 + i * 2),
+      ev('tool/result', { turn: 1, message: { source: { callId: `c${i}` }, content: [{ type: 'text', text: 'ok' }] } }, 2 + i * 2),
+    );
+  }
+  events.push(ev('turn/end', { turn: 1, reason: { kind: 'completed' } }, 100));
+  agent.session.events.push(...events);
+
+  const view = await bridge.getResult(started.session_id, 100, 'summary');
+  assert.ok(view.omitted_counts.tool_calls > 0, 'summary must omit the tail');
+  assert.equal(
+    view.truncated.tool_calls,
+    view.omitted_counts.tool_calls > 0,
+    'a dropped tool call must set truncated.tool_calls — the 0.8.0 bug reported false',
+  );
+});
+
+test('P1: next names the blocker instead of leaving a queued-but-idle snapshot ambiguous', async () => {
+  const { bridge, agents } = makeStatefulBridge();
+  const started = await bridge.startGoal({ workspace: 'ws-1', goal: 'explain me' });
+  const agent = agents.get(started.session_id);
+  settle(agent);
+  agent.session.events.push(
+    ev('turn/start', { turn: 1 }, 0),
+    ev('turn/end', { turn: 1, reason: { kind: 'completed' } }, 1),
+  );
+
+  // Queued input with an idle agent and no armed goal: nothing will consume it.
+  await bridge.updateGoal({ session_id: started.session_id, action: 'pause' });
+  agent.inbox.nextStep.push({ id: 'q1' });
+  const queued = await bridge.getTaskStatus(started.session_id);
+  assert.equal(queued.next.actionable, false);
+  assert.equal(queued.next.waiting_on, 'queue');
+  assert.equal(queued.next.recommendation, 'send_message');
+  assert.match(queued.next.reason, /no driver/);
+  agent.inbox.nextStep.length = 0;
+
+  // A parked approval outranks everything else.
+  bridge['relays']['approvals'].set('approval-9', {
+    id: 'approval-9', sessionId: started.session_id, toolName: 'bash', resolve: () => {},
+  });
+  const parked = await bridge.getTaskStatus(started.session_id);
+  assert.equal(parked.next.waiting_on, 'approval');
+  assert.equal(parked.next.recommendation, 'approve');
+  assert.equal(parked.next.actionable, false);
+  bridge['relays']['approvals'].delete('approval-9');
+
+  // Nothing pending and a finished turn: done, and it says so.
+  const done = await bridge.getTaskStatus(started.session_id);
+  assert.equal(done.next.waiting_on, 'nothing');
+  assert.equal(done.next.recommendation, 'done');
+});

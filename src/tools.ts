@@ -74,8 +74,8 @@ export function registerBridgeTools(server: McpServer, bridge: Bridge, surface: 
     {
       title: 'List DSH sessions',
       description:
-        'List sessions (live + persisted), newest first. DSH persistence is the authority: sessions ' +
-        'survive restarts and are continued by id.',
+        'List sessions (live + persisted), newest first. Returns {sessions, page}; page.has_more and ' +
+        'page.next_offset tell you whether another page exists, so no empty-page probe is needed.',
       inputSchema: z.object({
         limit: z.number().int().min(1).max(100).optional().describe('Max rows 1-100 (default 50)'),
         offset: z.number().int().min(0).optional().describe('Skip N rows (default 0)'),
@@ -86,11 +86,34 @@ export function registerBridgeTools(server: McpServer, bridge: Bridge, surface: 
         updated_after: z.string().optional().describe('ISO time; unknown updated_at is excluded'),
       }),
     },
-    safe(async (args: { limit?: number; offset?: number; workspace?: string; query?: string; title_exact?: string; state?: 'live' | 'persisted' | 'all'; updated_after?: string }) =>
-      bridge.listSessions({
-        limit: args.limit, offset: args.offset, workspace: args.workspace,
+    safe(async (args: { limit?: number; offset?: number; workspace?: string; query?: string; title_exact?: string; state?: 'live' | 'persisted' | 'all'; updated_after?: string }) => {
+      const limit = Math.min(Math.max(args.limit ?? 50, 1), 100);
+      const offset = Math.max(args.offset ?? 0, 0);
+      // Ask for one extra row instead of counting: "is there another page?" is
+      // answerable without a second request and without trusting a total.
+      const probe = await bridge.listSessions({
+        limit: limit + 1, offset, workspace: args.workspace,
         query: args.query, title_exact: args.title_exact, state: args.state, updated_after: args.updated_after,
-      })),
+      });
+      const hasMore = probe.length > limit;
+      return {
+        sessions: hasMore ? probe.slice(0, limit) : probe,
+        page: {
+          limit,
+          offset,
+          returned: hasMore ? limit : probe.length,
+          has_more: hasMore,
+          ...(hasMore ? { next_offset: offset + limit } : {}),
+          sort: 'created_at desc',
+          // `updated_after` drops rows whose updated_at is unknown (an unknown
+          // timestamp must never read as "recent"), so a filtered page is not a
+          // completeness claim about those rows.
+          ...(args.updated_after === undefined
+            ? {}
+            : { note: 'rows with an unknown updated_at are excluded by updated_after' }),
+        },
+      };
+    }),
   );
 
   if (on('dsh_get_session')) {

@@ -31,7 +31,7 @@ dsh plugin --profile web add /path/to/this/tree
 
 The profile pins `dsh-dot-mcp` as a `link:` dependency, so rebuilding this tree
 refreshes it; the host must recompose (reload/restart) to load new code. This
-tree is **v0.9.0** targeting DSH **0.2.1-rc.2**.
+tree is **v0.9.1** targeting DSH **0.2.1-rc.2**.
 
 ## The tools: 15 served, 22 available
 
@@ -40,7 +40,7 @@ from the settings panel):
 
 | Surface | Tools | `tools/list` | For |
 | --- | --- | --- | --- |
-| `core` (default) | **15** | 10,678 chars · ≈3.0k tokens | one door per intent |
+| `core` (default) | **15** | 10,726 chars · ≈3.0k tokens | one door per intent |
 | `full` | **22** | 14,695 chars · ≈4.1k tokens | + goal aliases, long-form inspector, receipt lookup, plaintext credentials |
 
 The surface is a **permission** surface, not a display filter: a name outside it

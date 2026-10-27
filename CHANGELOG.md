@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.9.1 — 2026-10-27
+
+Four defects found by driving the wire from a real client. None of them changed a
+tool name; all of them made a promise the response did not keep.
+
+### Fixed
+- **`total_max_chars` measured the wrong string.** The budget was enforced against
+  the compact JSON while the client receives the pretty-printed block, which is
+  ~40% larger — so a 1,000-char ceiling could ship 1,884 chars, and for a
+  `detail=summary` view every rung of the ladder was a no-op, so 500 and 1,000
+  produced byte-identical responses. The ladder now measures the served text,
+  gained rungs that actually bite (3 tool calls → 0, text → 0, files → 0, drop
+  `last_failure`) and reports `truncated.served_chars` / `budget_chars` /
+  `over_budget` when the irreducible skeleton alone exceeds the ceiling, instead
+  of silently overshooting.
+- **`omitted_counts` and `truncated.tool_calls` disagreed.** 38 dropped tool calls
+  were reported as `tool_calls: false` because the flag compared the already-capped
+  list against itself. Both fields now derive from the real turn total, and the
+  total-budget pass recomputes both from its own output — one裁剪 produces both,
+  so either can be trusted.
+- **A failure had one representation, not two.** Errors returned only a text block;
+  a client branching on `structuredContent` got whatever its connector synthesized,
+  which is how `WORKSPACE_NOT_FOUND` in the body sat next to `INVALID_ARGUMENT` in
+  the structured field. Both now come from a single object, and carry
+  `error.retryable` so "try again" and "fix the input" are distinguishable without
+  the caller keeping a table of our codes.
+- **`INTERNAL` was retryable in one place and not in another** — the fallback branch
+  hardcoded `false` while the code table listed it. It is now non-retryable
+  everywhere (an unexpected fault is not fixed by asking again).
+- The `WORKSPACE_NOT_FOUND` message no longer explains how to *create* a session
+  when the failure came from a *lookup*.
+
+### Added
+- **`dsh_get_task_status.next`** — `{actionable, waiting_on, recommendation, reason}`.
+  A snapshot like `status=queued` + idle agent + pending next-step meant three
+  different things depending on whether a goal was armed: a driver is about to run,
+  nothing will ever consume it, or the task already ended. `next` names the blocker
+  and the move, without collapsing the field set into one label.
+- **`dsh_list_sessions` returns `{sessions, page}`** with `has_more`, `next_offset`,
+  `sort`, so "is there another page?" no longer costs an empty probe request. Rows
+  excluded by `updated_after` (unknown `updated_at`) are called out in `page.note`.
+
+### Verification
+- 318 unit tests green (6 new: budget ceiling honoured or overshoot declared,
+  counts/flags agreement, page metadata, single-object errors, retryability, and
+  the `next` verdict for queued-but-idle / parked-approval / finished).
+
 ## 0.9.0 — 2026-10-27
 
 Tool-surface release: the bridge serves **one door per intent** by default and costs
